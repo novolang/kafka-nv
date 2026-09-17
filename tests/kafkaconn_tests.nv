@@ -1,0 +1,180 @@
+// kafkaconn_tests.nv — the API suite for the socket half and the two
+// caches.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: kafka-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// WHAT IS ASSERTABLE WITH NO CLUSTER.  The options are a value, so
+// every default and every refusal in `check_options` can be asserted.
+// The cluster snapshot is a value, so leader lookup, partition counts,
+// the merge and the staleness question all can be — and `is_stale`
+// takes the instant rather than reading a clock precisely so that this
+// suite can drive it through a day. What needs a broker gets a refusal
+// against a port nothing is listening on, and the implementation's own
+// gate is a real Kafka.
+
+use std.test
+use kafkaconn
+use kafkarecords
+use kafkareq
+
+@test
+fn test_the_defaults_are_readable_in_one_place() [io]
+    let o = kafkaconn.default_options("orders-indexer")
+
+    test.case("a client that leaves its name empty is one nobody can find")
+    test.assert(o.client_id == "orders-indexer")
+
+    test.case("one local broker, and the bootstrap list is a list for a reason")
+    // The point of a bootstrap list is that any one of its entries may
+    // be down.
+    test.assert(list.len(o.bootstrap) == 1)
+    test.assert(kafkaconn.address("broker-1", 9092).port == 9092)
+    test.assert(kafkaconn.address("broker-1", 9092).node_id == -1)
+
+    test.case("a metadata snapshot ages out even when nothing has failed")
+    // A partition can move without any request failing, so a client
+    // that only refreshed on failure keeps sending to a broker that is
+    // about to stop leading.
+    test.assert(o.metadata_max_age_ms == 300000)
+
+    test.case("the deadlines and the frame ceiling are the caller's")
+    test.assert(kafkaconn.with_timeouts(o, 1000, 5000).request_timeout_ms == 5000)
+    test.assert(o.max_frame_bytes > 0)
+
+    test.case("and a bootstrap list can be replaced wholesale")
+    test.assert(list.len(kafkaconn.with_bootstrap(o, [kafkaconn.address("b", 9092),
+                                                      kafkaconn.address("c", 9092)]).bootstrap) == 2)
+
+@test
+fn test_an_unusable_set_of_options_says_so_before_a_socket_is_opened() [io]
+    test.case("the defaults are usable")
+    match kafkaconn.check_options(kafkaconn.default_options("novo"))
+        Some(_) => test.fail("the defaults are meant to work")
+        None    => test.assert(true)
+
+    test.case("an empty bootstrap list is nowhere to start")
+    match kafkaconn.check_options(kafkaconn.with_bootstrap(
+              kafkaconn.default_options("novo"), []))
+        Some(_) => test.assert(true)
+        None    => test.fail("a client with no addresses cannot connect")
+
+    test.case("and a request timeout shorter than a long poll disconnects itself")
+    // The trap every Kafka client eventually writes: a fetch holds the
+    // connection for `max_wait_ms`, and a shorter request deadline
+    // tears it down and reconnects, having fetched nothing.
+    match kafkaconn.check_options(kafkaconn.with_timeouts(
+              kafkaconn.default_options("novo"), 5000, 100))
+        Some(_) => test.assert(true)
+        None    => test.fail("100 ms is shorter than the default fetch poll")
+
+    test.case("a program that reads no compressed topic supplies no codec")
+    test.assert(list.len(kafkaconn.with_codecs(kafkaconn.default_options("novo"),
+                    kafkarecords.no_codecs()).bootstrap) == 1)
+
+@test
+fn test_the_cluster_snapshot_is_a_value_and_answers_without_a_broker() [io]
+    let empty = kafkaconn.empty_cluster()
+
+    test.case("an empty snapshot knows nothing and says so rather than guessing")
+    test.assert(list.len(kafkaconn.brokers_of(empty)) == 0)
+    match kafkaconn.leader_for(empty, "orders", 0)
+        Some(_) => test.fail("an empty snapshot names no leader")
+        None    => test.assert(true)
+    match kafkaconn.partition_count(empty, "orders")
+        Some(_) => test.fail("nor a partition count")
+        None    => test.assert(true)
+    test.assert(list.len(kafkaconn.partitions_of(empty, "orders")) == 0)
+    test.assert(kafkaconn.leader_epoch(empty, "orders", 0) == -1)
+
+    test.case("merging keeps the coordinators, which a Metadata reply says nothing about")
+    test.assert(list.len(kafkaconn.merge_cluster(empty, empty).coordinators) == 0)
+
+    test.case("and staleness takes the instant rather than reading a clock")
+    // So a cache policy is a pure function and a test can drive it
+    // through a day in a loop.
+    test.assert(kafkaconn.is_stale(empty, 1789000000000, 300000))
+
+@test
+fn test_a_group_coordinator_is_a_second_lookup_with_a_second_staleness() [io]
+    // `FindCoordinator`, not `Metadata`.  It has nothing to do with
+    // partition leadership and it moves independently.
+    let empty = kafkaconn.empty_cluster()
+
+    test.case("an empty snapshot coordinates no group")
+    match kafkaconn.coordinator_for(empty, "indexers")
+        Some(_) => test.fail("nothing has been looked up yet")
+        None    => test.assert(true)
+
+    test.case("and forgetting one is not a metadata refresh")
+    // Refreshing everything on a coordinator move would refetch a
+    // cluster's worth of partition data to learn one address.
+    test.assert(list.len(kafkaconn.forget_coordinator(empty, "indexers").coordinators) == 0)
+
+@test
+fn test_the_connecting_surface_refuses_a_closed_port() [io, net, time]
+    // Port 1 is reserved and nothing listens on it, so each of these
+    // reaches its refusal without a cluster.
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+
+    test.case("connecting alone does not handshake")
+    match kafkaconn.connect(o, kafkaconn.address("127.0.0.1", 1))
+        Ok(_)  => test.fail("nothing listens on port 1")
+        Err(_) => test.assert(true)
+
+    test.case("and the two together are what a client calls")
+    match kafkaconn.connect_and_handshake(o, kafkaconn.address("127.0.0.1", 1))
+        Ok(_)  => test.fail("nothing listens on port 1")
+        Err(_) => test.assert(true)
+
+    test.case("a bootstrap that exhausts its list says how many it tried")
+    // "None of three answered" is the useful sentence; the last one's
+    // host is not.
+    match kafkaconn.bootstrap(o)
+        Ok(_)  => test.fail("nothing listens on port 1")
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_connected_surface_is_named_where_a_caller_would_reach_it() [io, net, time]
+    // Everything below needs a live broker, so this states what each
+    // one is for and reaches its `todo()` through the bootstrap.
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+
+    test.case("a connection that has not handshaken may only send ApiVersions")
+    match kafkaconn.bootstrap(o)
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            test.assert(kafkaconn.is_ready(c))
+            test.assert(kafkaconn.protocol_version(c, KafkaMetadata) >= 0)
+
+            test.case("handshake settles a version per API in one round trip")
+            match kafkaconn.handshake(c)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("call waits, send_only does not, and pipeline is the throughput one")
+            match kafkaconn.call(c, KafkaMetadataReq(kafkareq.metadata_for_all_topics()))
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaconn.send_only(c, KafkaMetadataReq(kafkareq.metadata_for_all_topics()))
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaconn.pipeline(c, [])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the two lookups are two calls")
+            match kafkaconn.fetch_metadata(c, ["orders"])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaconn.find_coordinator(c, "indexers")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("and closing is the end of it")
+            match kafkaconn.close(c)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)

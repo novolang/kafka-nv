@@ -1,0 +1,407 @@
+// kafkaadmin.nv — what a broker will tell you about itself, and the
+// three things this release cannot ask it to do.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE READS WORK AND THE WRITES DO NOT, AND THAT IS STATED HERE RATHER
+// THAN DISCOVERED.  Describing a cluster, listing topics, reading a
+// partition's ends and reading a group's committed offsets are all
+// answered by `Metadata`, `ListOffsets` and `OffsetFetch`, which
+// kafka-codec-nv 0.0.1 encodes.  Creating a topic, deleting one and
+// adding partitions are `CreateTopics`, `DeleteTopics` and
+// `CreatePartitions`, which it does not.  Those three are declared
+// here, with their signatures, and every one of them answers
+// `KclientNotSupported` naming the API key it needs — because the
+// alternative is either omitting them, which hides the gap from
+// anybody reading the interface, or implementing them against an
+// encoder that is not there.  The README's Status section carries the
+// same table.
+//
+// LAG IS THE ONE NUMBER AN OPERATOR ASKS FOR, AND IT TAKES TWO
+// REQUESTS.  A group's lag is the partition's latest offset minus the
+// group's committed offset, per partition, summed.  The first number
+// comes from `ListOffsets` against each partition's leader; the second
+// from `OffsetFetch` against the group's coordinator.  Different
+// brokers, different requests.  `group_lag` does both, and it is here
+// rather than in `kafkaconsumer` because the program that wants it is
+// usually not a consumer — it is a dashboard, and building a consumer
+// to answer a monitoring question would join the group and change the
+// thing being measured.
+//
+// AN UNCOMMITTED PARTITION IS NOT AT OFFSET ZERO.  `OffsetFetch`
+// answers `-1` for a partition a group has never committed.  A lag
+// report that treated that as zero would show the whole retained log
+// as lag for every new group, which is the one number that makes a
+// dashboard useless on the day it is turned on.  `KadminGroupOffset`
+// carries `has_committed` for that reason.
+
+use kafkaclienterror
+use kafkaconn
+use kafkagroup
+
+// A broker, as a report shows it.
+pub struct KadminBroker
+    node_id: Int
+    host: Str
+    port: Int
+    // Empty when the broker declares none.  What a KIP-392
+    // closest-replica read matches a client's own rack against.
+    rack: Str
+    // Whether this broker is the controller, which is the one that
+    // answers administrative writes.
+    is_controller: Bool
+
+// A topic, as a report shows it.
+pub struct KadminTopic
+    name: Str
+    // Empty before Kafka 2.8.
+    topic_id: Str
+    // `__consumer_offsets` and `__transaction_state` are internal.  A
+    // tool that listed them beside a user's topics would be showing
+    // Kafka's own bookkeeping as data.
+    is_internal: Bool
+    partitions: [KadminPartition]
+
+// A partition, as a report shows it.
+pub struct KadminPartition
+    index: Int
+    leader_id: Int
+    replica_nodes: [Int]
+    in_sync_nodes: [Int]
+    // Replicas that are not in sync.  A partition with any of these is
+    // one a produce with `acks = all` may refuse, so it is the field a
+    // health check reads.
+    offline_nodes: [Int]
+
+// A cluster, as a report shows it.
+pub struct KadminCluster
+    cluster_id: Str
+    controller_id: Int
+    brokers: [KadminBroker]
+    topics: [KadminTopic]
+
+// One end of one partition.
+pub struct KadminPartitionOffset
+    topic: Str
+    partition: Int
+    offset: Int
+    // The timestamp of the record at `offset`, or `-1` when the
+    // question was for an end rather than for a time.
+    timestamp_millis: Int
+
+// One partition's position for a group.
+pub struct KadminGroupOffset
+    topic: Str
+    partition: Int
+    // The next offset the group would read.  Meaningless unless
+    // `has_committed`.
+    next_offset: Int
+    // False when the group has never committed here, which
+    // `OffsetFetch` reports as `-1` — see the module comment.
+    has_committed: Bool
+    metadata: Str
+
+// One partition's lag for a group.
+pub struct KadminLag
+    topic: Str
+    partition: Int
+    // The partition's latest offset.
+    latest_offset: Int
+    // The group's next offset, or `-1`.
+    committed_offset: Int
+    // `latest_offset - committed_offset`, or `-1` when the group has
+    // never committed here.  `-1` and not the whole log: see the
+    // module comment.
+    lag: Int
+
+// A topic somebody wants created.
+//
+// Carried as a value even though this release cannot create one, so
+// that the shape a caller will use is published now and the
+// implementation adds no signature.
+pub struct KadminNewTopic
+    name: Str
+    partition_count: Int
+    // `-1` to let the broker use its default.
+    replication_factor: Int
+    // Topic-level configuration: `cleanup.policy`, `retention.ms`,
+    // `min.insync.replicas`.  Pairs rather than a map type, because a
+    // map in a published signature is a decision the implementation
+    // should get to make.
+    config_keys: [Str]
+    config_values: [Str]
+
+// ── the reads, which work ────────────────────────────────────────────
+
+// Describe the cluster: its id, its controller, its brokers and its
+// topics.
+//
+// One `Metadata` request for every topic.
+//
+// ```novo
+// use kafkaadmin
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             match kafkaadmin.describe_cluster(c)
+//                 Ok(r)  => println("${list.len(r.cluster.brokers)} brokers")
+//                 Err(_) => println("could not describe it")
+// ```
+pub fn describe_cluster(c: kafkaconn.Kconn) -> Result<KadminClusterReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.describe_cluster")
+
+// A connection and a cluster description.
+pub struct KadminClusterReply
+    conn: kafkaconn.Kconn
+    cluster: KadminCluster
+
+// Describe named topics.
+//
+// A topic that does not exist comes back with an error code rather
+// than being absent, because "no such topic" and "I did not ask about
+// it" are different answers and a caller checking for existence needs
+// the first.
+pub fn describe_topics(c: kafkaconn.Kconn,
+                       topics: [Str]) -> Result<KadminTopicsReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.describe_topics")
+
+// A connection and some topic descriptions.
+pub struct KadminTopicsReply
+    conn: kafkaconn.Kconn
+    topics: [KadminTopic]
+
+// Every topic name in the cluster, internal ones included.
+//
+// `is_internal_topic` is what filters them, rather than this function
+// deciding for the caller — a tool auditing retention wants
+// `__consumer_offsets` in the list.
+pub fn list_topics(c: kafkaconn.Kconn) -> Result<KadminNamesReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.list_topics")
+
+// A connection and some names.
+pub struct KadminNamesReply
+    conn: kafkaconn.Kconn
+    names: [Str]
+
+// Whether a topic name is one of Kafka's own.
+//
+// `[]`.  True for `__consumer_offsets`, `__transaction_state` and the
+// rest of the double-underscore set.
+//
+// ```novo
+// use kafkaadmin
+//
+// fn main() [io]
+//     println("${kafkaadmin.is_internal_topic("__consumer_offsets")}")   // true
+// ```
+pub fn is_internal_topic(name: Str) -> Bool
+    todo("kafka-nv.kafkaadmin.is_internal_topic")
+
+// Whether a topic exists.
+//
+// A named question rather than a list walk, because a caller doing
+// this before a produce should not fetch the whole cluster's metadata
+// to answer it.
+pub fn topic_exists(c: kafkaconn.Kconn,
+                    name: Str) -> Result<KadminBoolReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.topic_exists")
+
+// A connection and a yes or no.
+pub struct KadminBoolReply
+    conn: kafkaconn.Kconn
+    value: Bool
+
+// The earliest offset each partition of a topic still holds.
+//
+// The bottom of the retention window.  A consumer whose committed
+// offset is below this has lost records to retention, which is the one
+// failure that produces no error anywhere.
+pub fn earliest_offsets(c: kafkaconn.Kconn,
+                        topic: Str) -> Result<KadminOffsetsReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.earliest_offsets")
+
+// The offset one past the last record of each partition of a topic.
+//
+// The number a lag is measured against.
+pub fn latest_offsets(c: kafkaconn.Kconn,
+                      topic: Str) -> Result<KadminOffsetsReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.latest_offsets")
+
+// The first offset at or after an instant, per partition.
+//
+// The instant is milliseconds since the Unix epoch.  A partition with
+// no record that late answers `-1`, which means "nothing here yet" and
+// not offset minus one.
+pub fn offsets_at_time(c: kafkaconn.Kconn, topic: Str,
+                       unix_millis: Int) -> Result<KadminOffsetsReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.offsets_at_time")
+
+// A connection and some partition offsets.
+pub struct KadminOffsetsReply
+    conn: kafkaconn.Kconn
+    offsets: [KadminPartitionOffset]
+
+// How many records a topic holds, per partition.
+//
+// `latest - earliest`.  Not the number of records ever written, which
+// nothing in Kafka reports: a compacted or expired topic has forgotten
+// some.
+pub fn partition_sizes(c: kafkaconn.Kconn,
+                       topic: Str) -> Result<KadminOffsetsReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.partition_sizes")
+
+// A group's committed offsets.
+//
+// An empty topic list asks for every partition the group has
+// committed.  Goes to the group's COORDINATOR, which is a different
+// broker from the partition leaders.
+pub fn group_offsets(c: kafkaconn.Kconn, group_id: Str,
+                     topics: [Str]) -> Result<KadminGroupOffsetsReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.group_offsets")
+
+// A connection and a group's offsets.
+pub struct KadminGroupOffsetsReply
+    conn: kafkaconn.Kconn
+    offsets: [KadminGroupOffset]
+
+// A group's lag, per partition.
+//
+// Two requests to two different brokers — see the module comment. A
+// partition the group has never committed answers a lag of `-1` rather
+// than the whole retained log.
+//
+// ```novo
+// use kafkaadmin
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             match kafkaadmin.group_lag(c, "indexers", ["orders"])
+//                 Ok(r)  => println("${list.len(r.lags)} partitions")
+//                 Err(_) => println("could not measure it")
+// ```
+pub fn group_lag(c: kafkaconn.Kconn, group_id: Str,
+                 topics: [Str]) -> Result<KadminLagReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.group_lag")
+
+// A connection and a group's lag.
+pub struct KadminLagReply
+    conn: kafkaconn.Kconn
+    lags: [KadminLag]
+
+// A group's lag summed across its partitions.
+//
+// `[]`.  Skips the partitions the group has never committed rather
+// than counting them, so a group that is halfway through its first
+// assignment reports the lag of what it holds.
+//
+// ```novo
+// use kafkaadmin
+//
+// fn main() [io]
+//     println("${kafkaadmin.total_lag([])}")             // 0
+// ```
+pub fn total_lag(lags: [KadminLag]) -> Int
+    todo("kafka-nv.kafkaadmin.total_lag")
+
+// Turn a group's stored offsets into the shape `kafkagroup` uses.
+//
+// `[]`, and the seam between a report and a consumer: a tool that
+// measures a group and then repositions it hands these to
+// `kafkagroup.commit_offsets`.
+pub fn as_group_offsets(offsets: [KadminGroupOffset]) -> [kafkagroup.KgroupOffset]
+    todo("kafka-nv.kafkaadmin.as_group_offsets")
+
+// ── the writes, which this release cannot do ─────────────────────────
+
+// A topic to be created.
+//
+// `[]`, and it works: the value can be built and inspected today. It
+// is `create_topic` that cannot send it.
+//
+// ```novo
+// use kafkaadmin
+//
+// fn main() [io]
+//     println("${kafkaadmin.new_topic("orders", 12, 3).partition_count}")   // 12
+// ```
+pub fn new_topic(name: Str, partitions: Int, replication_factor: Int) -> KadminNewTopic
+    todo("kafka-nv.kafkaadmin.new_topic")
+
+// The same topic with one configuration entry, such as
+// `("retention.ms", "604800000")`.
+pub fn with_config(t: KadminNewTopic, key: Str, value: Str) -> KadminNewTopic
+    todo("kafka-nv.kafkaadmin.with_config")
+
+// Create a topic.
+//
+// **Answers `KclientNotSupported` in this release**, naming
+// `CreateTopics` — the API key kafka-codec-nv 0.0.1 does not encode.
+// The signature is published so that the shape does not change when
+// the codec grows the key; see the module comment and the README's
+// Status section.
+//
+// ```novo
+// use kafkaadmin
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             match kafkaadmin.create_topic(c, kafkaadmin.new_topic("orders", 12, 3))
+//                 Ok(_)  => println("created")
+//                 Err(_) => println("this release cannot encode CreateTopics")
+// ```
+pub fn create_topic(c: kafkaconn.Kconn,
+                    t: KadminNewTopic) -> Result<kafkaconn.Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.create_topic")
+
+// Delete a topic.
+//
+// **Answers `KclientNotSupported` in this release**, naming
+// `DeleteTopics`.
+pub fn delete_topic(c: kafkaconn.Kconn,
+                    name: Str) -> Result<kafkaconn.Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.delete_topic")
+
+// Add partitions to a topic.
+//
+// **Answers `KclientNotSupported` in this release**, naming
+// `CreatePartitions`.  Worth knowing whatever the release: adding
+// partitions changes where every keyed record lands, because the
+// partition is `hash(key) mod count`, so a topic whose ordering
+// matters cannot be widened without a plan for the records already in
+// it.
+pub fn create_partitions(c: kafkaconn.Kconn, name: Str,
+                         total: Int) -> Result<kafkaconn.Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaadmin.create_partitions")
+
+// Whether an administrative operation is one this release can perform.
+//
+// `[]`, and the mechanical form of the README's Status table: a tool
+// that builds a menu of what it can offer reads this rather than
+// hard-coding the same list a second time.
+//
+// ```novo
+// use kafkaadmin
+//
+// fn main() [io]
+//     println("${kafkaadmin.supports("describe_cluster")}")   // true
+//     println("${kafkaadmin.supports("create_topic")}")       // false
+// ```
+pub fn supports(operation: Str) -> Bool
+    todo("kafka-nv.kafkaadmin.supports")
+
+// The operations this release cannot perform, and the API key each one
+// is waiting for.
+//
+// `["create_topic: CreateTopics", "delete_topic: DeleteTopics",
+// "create_partitions: CreatePartitions"]`.
+pub fn unsupported_operations() -> [Str]
+    todo("kafka-nv.kafkaadmin.unsupported_operations")

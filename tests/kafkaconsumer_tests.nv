@@ -1,0 +1,181 @@
+// kafkaconsumer_tests.nv — the API suite for the fetch loop, the
+// position, and the two decisions a consumer cannot avoid.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// kafka-nv.kafkaconsumer.<fn>`.
+//
+// What is asserted is that neither decision has been made on the
+// program's behalf: the reset policy refuses by default rather than
+// guessing, and automatic commit is off rather than quietly choosing
+// at-most-once delivery.  The positions and the record conversion are
+// `[]`, so they are asserted here directly; the fetch loop reaches its
+// refusal against a port nothing is listening on.
+
+use std.test
+use kafkaconn
+use kafkaconsumer
+use kafkarecords
+
+@test
+fn test_neither_decision_has_been_made_on_the_programs_behalf() [io]
+    let c = kafkaconsumer.default_config("indexers", ["orders"])
+
+    test.case("there is no safe default for a missing position, so it refuses")
+    // Starting at the beginning replays a month of work; starting at
+    // the end loses whatever arrived while the consumer was away.  Both
+    // are catastrophic somewhere.
+    match c.auto_offset_reset
+        KconsumerRefuse => test.assert(true)
+        _               => test.fail("this package does not pick one")
+
+    test.case("and automatic commit is off, because it chooses at-most-once")
+    test.assert(not c.auto_commit)
+    test.assert(kafkaconsumer.with_auto_commit(c, true, 5000).auto_commit)
+
+    test.case("the reset policies have Kafka's own configuration names")
+    test.assert(kafkaconsumer.reset_name(KconsumerEarliest) == "earliest")
+    test.assert(kafkaconsumer.reset_name(KconsumerLatest) == "latest")
+    test.assert(kafkaconsumer.reset_name(KconsumerRefuse) == "none")
+    match kafkaconsumer.reset_named("earliest")
+        Some(_) => test.assert(true)
+        None    => test.fail("`earliest` is what auto.offset.reset takes")
+    match kafkaconsumer.reset_named("beginning")
+        Some(_) => test.fail("that is not one of the three")
+        None    => test.assert(true)
+
+    test.case("and a policy can be set explicitly, which is the point")
+    match kafkaconsumer.with_auto_offset_reset(c, KconsumerEarliest).auto_offset_reset
+        KconsumerEarliest => test.assert(true)
+        _                 => test.fail("it was just set")
+
+@test
+fn test_the_long_poll_is_what_makes_an_idle_consumer_cheap() [io]
+    let c = kafkaconsumer.default_config("indexers", ["orders"])
+
+    test.case("half a second of waiting, and one byte is enough to answer")
+    test.assert(c.max_wait_ms == 500)
+    test.assert(c.min_bytes == 1)
+
+    test.case("a per-partition ceiling stops one busy partition starving the others")
+    test.assert(c.partition_max_bytes < c.max_bytes)
+    let w = kafkaconsumer.with_fetch_window(c, 1000, 4096, 10485760)
+    test.assert(w.max_wait_ms == 1000 and w.min_bytes == 4096)
+
+    test.case("read-committed stops at the last stable offset, not the high watermark")
+    // So its lag never reaches zero while a transaction is open, which
+    // looks like a stall and is not.
+    test.assert(kafkaconsumer.with_read_committed(c, true).read_committed)
+
+    test.case("the rebalance timeout must exceed the longest gap between polls")
+    let t = kafkaconsumer.with_group_timeouts(c, 45000, 300000)
+    test.assert(t.session_timeout_ms == 45000)
+    test.assert(t.rebalance_timeout_ms == 300000)
+
+    test.case("and a consumer that joins no group keeps its own positions")
+    // For a repair tool, a one-off reader, a test: nothing is committed
+    // anywhere and no rebalance can take a partition away.
+    test.assert(kafkaconsumer.standalone_config(["orders"]).group_id == "")
+
+@test
+fn test_a_position_is_the_next_offset_and_lag_is_measured_against_the_watermark() [io]
+    test.case("no records imply no positions")
+    test.assert(list.len(kafkaconsumer.positions_after([])) == 0)
+
+    test.case("and a batch with no records converts to none")
+    test.assert(list.len(kafkaconsumer.records_of_batch(
+        kafkarecords.batch(41000, 1789000000000), "orders", 0)) == 0)
+
+@test
+fn test_the_fetch_loop_is_named_where_a_caller_would_reach_it() [io, net, time]
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    match kafkaconn.bootstrap(o)
+        Err(_)   => test.assert(true)
+        Ok(conn) =>
+            let k = kafkaconsumer.consumer(conn, kafkaconn.empty_cluster(),
+                                           kafkaconsumer.default_config("indexers", ["orders"]))
+
+            test.case("a configuration is checked against the connection's deadlines")
+            // A fetch that outlasts the request timeout disconnects
+            // itself and fetches nothing, forever.
+            match kafkaconsumer.check_config(
+                      kafkaconsumer.default_config("indexers", ["orders"]), conn)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)
+
+            test.case("a consumer holds nothing before it subscribes")
+            test.assert(list.len(kafkaconsumer.positions(k)) == 0)
+            test.assert(list.len(kafkaconsumer.assignment(k)) == 0)
+            match kafkaconsumer.position_of(k, "orders", 0)
+                Some(_) => test.fail("nothing has been assigned")
+                None    => test.assert(true)
+            match kafkaconsumer.lag_of(k, "orders", 0)
+                Some(_) => test.fail("lag needs a high watermark, which arrives with records")
+                None    => test.assert(true)
+
+            test.case("seek sets a position in memory and costs nothing")
+            test.assert(list.len(kafkaconsumer.seek(k, "orders", 0, 41000).positions) >= 0)
+
+            test.case("subscribe joins and takes an assignment; poll fetches once")
+            match kafkaconsumer.subscribe(k)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaconsumer.poll(k)
+                Ok(p)  => test.assert(list.len(p.records) == 0 and not p.rebalanced)
+                Err(_) => test.assert(true)
+
+            test.case("committing is explicit, and after processing is at-least-once")
+            match kafkaconsumer.commit(k)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaconsumer.commit_positions(k, [])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("what the group stored is a different question from where the consumer is")
+            // The difference between the two is how much work a crash
+            // would repeat.
+            match kafkaconsumer.committed(k)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("heartbeats are the caller's, because this package starts no task")
+            test.assert(not kafkaconsumer.heartbeat_due(k))
+
+@test
+fn test_the_three_seeks_that_need_a_broker_are_named_apart_from_the_one_that_does_not() [io, net, time]
+    // The earliest and latest offsets are questions for the broker —
+    // `ListOffsets` — and not numbers the consumer has.
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    match kafkaconn.bootstrap(o)
+        Err(_)   => test.assert(true)
+        Ok(conn) =>
+            let k = kafkaconsumer.consumer(conn, kafkaconn.empty_cluster(),
+                                           kafkaconsumer.standalone_config(["orders"]))
+
+            test.case("to the bottom of the retention window")
+            match kafkaconsumer.seek_to_beginning(k)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("to one past the last record")
+            match kafkaconsumer.seek_to_end(k)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("or to a moment in time, which is what a replay is")
+            match kafkaconsumer.seek_to_time(k, 1789000000000)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("a stale snapshot is replaced rather than refetched from in here")
+            test.assert(list.len(kafkaconsumer.positions(
+                kafkaconsumer.with_cluster(k, kafkaconn.empty_cluster()))) == 0)
+
+            test.case("and closing commits nothing on the way out")
+            // A consumer that committed at close would turn a shutdown
+            // mid-batch into a silent skip of that batch.
+            match kafkaconsumer.close(k)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)

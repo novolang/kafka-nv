@@ -1,0 +1,539 @@
+// kafkaproducer.nv — batching, partitioning and acknowledgement, with
+// the socket in exactly one function.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `send` DOES NOT SEND.  It chooses the partition, checks the record
+// against the size ceilings, appends it to that partition's batch and
+// answers whether the batch must now go out.  `flush` is the only
+// function here that writes to a socket.  Everything else in this
+// module is `[]`.
+//
+// That is the package's load-bearing decision, and the reason is that
+// batching is where a producer is fast or slow and where it is correct
+// or wrong, and it is the part nobody can test against a real cluster
+// with any confidence.  Pure, it can be: feed a thousand messages of
+// known sizes through and assert exactly how many batches came out, at
+// what boundaries, in what order, with which records refused.  A
+// producer whose batching is entangled with its socket is a producer
+// whose batching is tested by watching a broker's metrics.
+//
+// The by-product is the name.  `send` that returns having sent nothing
+// would be a lie in most libraries; here the type says so — it answers
+// a `KproducerAccepted`, and `must_flush` on it is the whole of what a
+// caller has to act on.
+//
+// THE PARTITION IS CHOSEN BY THE CLIENT AND IT DECIDES ORDERING.
+// Kafka guarantees order within a partition and nothing across
+// partitions, so which partition a record lands in is the whole of the
+// ordering a program gets.  A record with a key goes to
+// `hash(key) mod partitions` and therefore always to the same
+// partition; a record without one is spread.  A caller that let a null
+// key through where it meant a key has spread its own ordering across
+// the cluster, and that is why `kafkarecords.record_without_key` is
+// spelled separately.
+//
+// `acks` IS THE DURABILITY DIAL AND ITS ZERO SETTING CHANGES THE
+// PROTOCOL.  `KproducerAckNone` means the broker sends no response at
+// all — not an empty one, none — so a flush cannot report which
+// records were written, because nothing comes back.  `KproducerAckAll`
+// waits for every in-sync replica and is the only setting under which
+// `NOT_ENOUGH_REPLICAS` can be reported at all.  The three are an enum
+// rather than the protocol's `0`, `1` and `-1` because `-1` meaning
+// "the strongest" is a wire encoding and not a thing to type.
+//
+// IDEMPOTENCE CONSTRAINS TWO OTHER SETTINGS AND THE CHECK IS AT
+// START-UP.  An idempotent producer needs `acks = all` and at most
+// five requests in flight per connection, because that is how many
+// batches per partition a broker can deduplicate.  `with_idempotence`
+// refuses a configuration that breaks either, rather than producing a
+// client that silently duplicates under retry.
+//
+// RETRIES CARRY NO JITTER OF THEIR OWN.  A backoff needs randomness,
+// and `[rand]` is an effect this package does not declare.  The jitter
+// is a parameter of `with_retries`, so a test replays a retry sequence
+// exactly and a caller that wants real jitter passes what its own
+// generator produced.
+
+use kafkaclienterror
+use kafkaconn
+use kafkarecords
+
+// How many replicas must acknowledge a write.
+//
+// ```novo
+// use kafkaproducer
+//
+// fn main() [io]
+//     println("${kafkaproducer.ack_number(KproducerAckAll)}")     // -1
+// ```
+pub enum KproducerAck
+    // `0`.  The broker sends NO RESPONSE, so a flush learns nothing
+    // and a lost record is not reported.  For a stream of measurements
+    // where the next one is along in a second anyway.
+    KproducerAckNone
+    // `1`.  The leader has written it.  Lost if the leader fails
+    // before a replica catches up.
+    KproducerAckLeader
+    // `-1`.  Every in-sync replica has written it.  The only setting
+    // under which `min.insync.replicas` means anything, and the only
+    // one an idempotent producer may use.
+    KproducerAckAll
+
+// How a record with no explicit partition is placed.
+pub enum KproducerPartitioner
+    // A record with a key goes to `hash(key) mod partitions`, so the
+    // same key always lands in the same partition and its records stay
+    // in order.  A record with no key is spread.  Kafka's own default.
+    KproducerByKeyHash
+    // Every record is spread, key or not.  For a topic where nothing
+    // is ordered and the only goal is even load.
+    KproducerRoundRobin
+
+// What a producer does with what it is given.
+pub struct KproducerConfig
+    acks: KproducerAck
+    // How long a partially full batch waits for company before it goes
+    // out, in milliseconds.  `0` sends as soon as there is anything,
+    // which costs a round trip per record; a few milliseconds is
+    // usually the difference between a thousand records a second and a
+    // hundred thousand.  The one setting that trades latency for
+    // throughput directly.
+    linger_ms: Int
+    // A batch goes out when it reaches this many bytes, whatever the
+    // linger says.
+    batch_max_bytes: Int
+    // The ceiling on a whole produce request.  A record larger than
+    // this can never be sent at all, and is refused at `send`.
+    max_request_bytes: Int
+    // How long the BROKER may wait for the acknowledgements.  Carried
+    // in the request; the client's own deadline is the connection's.
+    request_timeout_ms: Int
+    compression: kafkarecords.KafkaCompression
+    partitioner: KproducerPartitioner
+    // How many times a retriable failure is retried before it is
+    // reported.
+    retries: Int
+    retry_backoff_ms: Int
+    // Added to each backoff.  A parameter and not a random number —
+    // see the module comment.
+    retry_jitter_ms: Int
+    // How many produce requests may be outstanding on one connection.
+    // At most five when `idempotent`, because that is how many batches
+    // per partition a broker can deduplicate.
+    max_in_flight: Int
+    // Whether the broker should deduplicate retries.  Requires
+    // `KproducerAckAll` and `max_in_flight` of five or fewer.
+    idempotent: Bool
+
+// One record to produce.
+pub struct KproducerMessage
+    topic: Str
+    // `-1` to let the partitioner choose.  A value picks the partition
+    // and bypasses the key hash entirely.
+    partition: Int
+    key: Bytes
+    // A null key is spread across partitions and a present one is
+    // hashed to a single partition, so which of the two this is
+    // decides the record's ordering — see the module comment.
+    key_is_null: Bool
+    value: Bytes
+    // A null value on a compacted topic DELETES the key.  An empty one
+    // stores no bytes under it.
+    value_is_null: Bool
+    headers: [kafkarecords.KafkaRecordHeader]
+    // Milliseconds since the Unix epoch, or `-1` to let `send` stamp
+    // it.  A caller replaying a log passes the original instant, which
+    // is what makes a replay produce the same batches.
+    timestamp_millis: Int
+
+// A producer, its configuration and everything not yet sent.
+pub struct Kproducer
+    conn: kafkaconn.Kconn
+    cluster: kafkaconn.KconnCluster
+    config: KproducerConfig
+    // One batch per topic and partition, being filled.
+    pending: [KproducerBatch]
+    // How many bytes are held across every pending batch.
+    buffered_bytes: Int
+    // When the oldest pending batch was opened, in milliseconds since
+    // the Unix epoch.  What the linger deadline is measured from, and
+    // a field rather than a clock read so that `should_flush` is the
+    // only thing here that consults the time.
+    oldest_batch_millis: Int
+    closed: Bool
+
+// One partition's batch, being filled.
+pub struct KproducerBatch
+    topic: Str
+    partition: Int
+    batch: kafkarecords.KafkaRecordBatch
+
+// What `send` answers.
+pub struct KproducerAccepted
+    producer: Kproducer
+    // How many records are now buffered across every partition.
+    queued: Int
+    // Whether a batch has reached `batch_max_bytes` and should go out
+    // now.  A caller that ignores this still gets its records sent at
+    // the next `flush`; one that acts on it gets full batches.
+    must_flush: Bool
+
+// What one partition's write produced.
+pub struct KproducerResult
+    topic: Str
+    partition: Int
+    // The offset the first record of the batch was written at, or `-1`
+    // when the write failed or when `acks` was `KproducerAckNone` and
+    // nothing came back.
+    base_offset: Int
+    // How many records went out in this batch, so a caller can map
+    // offsets back to the messages it sent.
+    count: Int
+    error: ?kafkaclienterror.KclientFault
+
+// A producer and what a flush produced.
+pub struct KproducerFlushed
+    producer: Kproducer
+    results: [KproducerResult]
+
+// ── configuration, all of it pure ────────────────────────────────────
+
+// A configuration for the ordinary case: acknowledge from every
+// in-sync replica, linger five milliseconds, sixteen-kilobyte batches,
+// a one-megabyte request ceiling, thirty-second broker timeout, no
+// compression, hash by key, five retries with a hundred-millisecond
+// backoff and no jitter, five requests in flight, not idempotent.
+//
+// ```novo
+// use kafkaproducer
+//
+// fn main() [io]
+//     println("${kafkaproducer.default_config().linger_ms}")      // 5
+// ```
+pub fn default_config() -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.default_config")
+
+// The same configuration with an acknowledgement policy.
+//
+// ```novo
+// use kafkaproducer
+//
+// fn main() [io]
+//     let c = kafkaproducer.with_acks(kafkaproducer.default_config(), KproducerAckLeader)
+//     println("${kafkaproducer.ack_number(c.acks)}")              // 1
+// ```
+pub fn with_acks(c: KproducerConfig, a: KproducerAck) -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.with_acks")
+
+// The same configuration with a linger.
+//
+// `0` sends as soon as there is anything to send, which costs a round
+// trip per record.
+pub fn with_linger(c: KproducerConfig, linger_ms: Int) -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.with_linger")
+
+// The same configuration with the two size ceilings.
+pub fn with_batching(c: KproducerConfig, batch_max_bytes: Int,
+                     max_request_bytes: Int) -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.with_batching")
+
+// The same configuration with a compression codec.
+//
+// The codec's own functions come from the connection's
+// `KafkaCodecSet`; this only declares which of them to use.  A
+// configuration that names a codec the connection does not hold is
+// caught by `check_config` rather than at the first flush.
+pub fn with_compression(c: KproducerConfig, codec: kafkarecords.KafkaCompression) -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.with_compression")
+
+// The same configuration with a partitioner.
+pub fn with_partitioner(c: KproducerConfig, p: KproducerPartitioner) -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.with_partitioner")
+
+// The same configuration with a retry policy.
+//
+// The jitter is a number the caller supplies rather than one this
+// package generates, because generating it would cost `[rand]` and
+// because a test that cannot fix the jitter cannot assert a retry
+// schedule — see the module comment.
+pub fn with_retries(c: KproducerConfig, retries: Int, backoff_ms: Int,
+                    jitter_ms: Int) -> KproducerConfig
+    todo("kafka-nv.kafkaproducer.with_retries")
+
+// The same configuration with idempotence on or off.
+//
+// Refuses a configuration whose `acks` is not `KproducerAckAll` or
+// whose `max_in_flight` is above five, naming the field.  An
+// idempotent producer built on either would duplicate records under
+// retry, which is the exact failure idempotence exists to prevent.
+//
+// ```novo
+// use kafkaproducer
+//
+// fn main() [io]
+//     let c = kafkaproducer.with_acks(kafkaproducer.default_config(), KproducerAckNone)
+//     match kafkaproducer.with_idempotence(c, true)
+//         Ok(_)  => println("this cannot happen")
+//         Err(_) => println("idempotence needs acks = all")
+// ```
+pub fn with_idempotence(c: KproducerConfig,
+                        on: Bool) -> Result<KproducerConfig, kafkaclienterror.KclientFault>
+    todo("kafka-nv.kafkaproducer.with_idempotence")
+
+// The fault in an unusable configuration, or `None`.
+//
+// Run at start-up, where the message can name the field.  Catches a
+// batch ceiling above the request ceiling, a linger longer than the
+// broker timeout, an idempotent producer whose other settings
+// contradict it, and a compression codec the connection has no
+// function for.
+pub fn check_config(c: KproducerConfig, conn: kafkaconn.Kconn) -> ?kafkaclienterror.KclientFault
+    todo("kafka-nv.kafkaproducer.check_config")
+
+// The number the protocol puts on the wire for an acknowledgement
+// policy: `0`, `1`, `-1`.
+pub fn ack_number(a: KproducerAck) -> Int
+    todo("kafka-nv.kafkaproducer.ack_number")
+
+// ── messages, all of it pure ─────────────────────────────────────────
+
+// A record with a key and a value.
+//
+// The key decides the partition and therefore the ordering — see the
+// module comment.
+//
+// ```novo
+// use kafkaproducer
+//
+// fn main() [io]
+//     let m = kafkaproducer.message("orders", bytes.from_str("order-7"),
+//                                   bytes.from_str("{}"))
+//     println(m.topic)
+// ```
+pub fn message(topic: Str, key: Bytes, value: Bytes) -> KproducerMessage
+    todo("kafka-nv.kafkaproducer.message")
+
+// A record with no key, which is spread across the partitions.
+//
+// Spelled separately from a record with an empty key, because the
+// difference is whether this record is ordered against the others with
+// the same key.
+pub fn message_without_key(topic: Str, value: Bytes) -> KproducerMessage
+    todo("kafka-nv.kafkaproducer.message_without_key")
+
+// A tombstone: a key with a null value, which deletes the key on a
+// compacted topic.
+pub fn tombstone(topic: Str, key: Bytes) -> KproducerMessage
+    todo("kafka-nv.kafkaproducer.tombstone")
+
+// The same message aimed at one partition, bypassing the partitioner.
+//
+// For a caller that has computed the placement itself — a job that
+// shards by customer and already knows which shard this is.
+pub fn to_partition(m: KproducerMessage, partition: Int) -> KproducerMessage
+    todo("kafka-nv.kafkaproducer.to_partition")
+
+// The same message with record headers.
+pub fn with_headers(m: KproducerMessage,
+                    headers: [kafkarecords.KafkaRecordHeader]) -> KproducerMessage
+    todo("kafka-nv.kafkaproducer.with_headers")
+
+// The same message stamped at an instant, in milliseconds since the
+// Unix epoch.
+//
+// A caller replaying a log passes the original instant, which is what
+// makes the replay produce the same batches as the original run.
+pub fn at_time(m: KproducerMessage, unix_millis: Int) -> KproducerMessage
+    todo("kafka-nv.kafkaproducer.at_time")
+
+// ── the producer: pure until `flush` ─────────────────────────────────
+
+// A producer over a connection and a cluster snapshot.
+//
+// ```novo
+// use kafkaproducer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+//                                            kafkaproducer.default_config())
+//             println("${kafkaproducer.buffered_count(p)}")       // 0
+// ```
+pub fn producer(c: kafkaconn.Kconn, cluster: kafkaconn.KconnCluster,
+                config: KproducerConfig) -> Kproducer
+    todo("kafka-nv.kafkaproducer.producer")
+
+// Buffer a record.  DOES NOT SEND.
+//
+// Chooses the partition, refuses a record larger than
+// `max_request_bytes`, appends it to that partition's batch and
+// answers whether a batch is now full.  `[]`, and that is the module's
+// whole design — see the module comment.
+//
+// Answers `KclientNoLeader` when the cluster snapshot does not name a
+// partition count for the topic, because a partitioner cannot hash
+// against a number it does not have: refresh the metadata and send
+// again.
+//
+// ```novo
+// use kafkaproducer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+//                                            kafkaproducer.default_config())
+//             match kafkaproducer.send(p, kafkaproducer.message("orders",
+//                                          bytes.from_str("k"), bytes.from_str("v")))
+//                 Ok(a)  => println("${a.queued} queued, flush now: ${a.must_flush}")
+//                 Err(_) => println("refused before any socket was touched")
+// ```
+pub fn send(p: Kproducer,
+            m: KproducerMessage) -> Result<KproducerAccepted, kafkaclienterror.KclientFault>
+    todo("kafka-nv.kafkaproducer.send")
+
+// Which partition a message would go to.
+//
+// Public because a caller that needs to know where a record landed —
+// to log it, to route a reply, to assert a test — should not have to
+// send one to find out.
+//
+// ```novo
+// use kafkaproducer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+//                                            kafkaproducer.default_config())
+//             match kafkaproducer.partition_for(p, kafkaproducer.message("orders",
+//                                                   bytes.from_str("k"), bytes.from_str("v")))
+//                 Ok(n)  => println("partition ${n}")
+//                 Err(_) => println("the snapshot does not know that topic")
+// ```
+pub fn partition_for(p: Kproducer,
+                     m: KproducerMessage) -> Result<Int, kafkaclienterror.KclientFault>
+    todo("kafka-nv.kafkaproducer.partition_for")
+
+// How many records are buffered.
+pub fn buffered_count(p: Kproducer) -> Int
+    todo("kafka-nv.kafkaproducer.buffered_count")
+
+// How many bytes are buffered, as they would be encoded.
+//
+// The encoded size and not the sum of the payloads: a batch's records
+// carry varint deltas whose width depends on the batch, so a producer
+// measuring against a ceiling has to ask the codec.
+pub fn buffered_bytes(p: Kproducer) -> Int
+    todo("kafka-nv.kafkaproducer.buffered_bytes")
+
+// How many partitions have something waiting.
+//
+// What a flush turns into produce requests: one per leader, each
+// covering every pending partition that leader holds.
+pub fn pending_partitions(p: Kproducer) -> Int
+    todo("kafka-nv.kafkaproducer.pending_partitions")
+
+// Whether a batch has reached `batch_max_bytes`.
+//
+// `[]`: a size question needs no clock.
+pub fn is_full(p: Kproducer) -> Bool
+    todo("kafka-nv.kafkaproducer.is_full")
+
+// Whether anything should go out now.
+//
+// `[time]` AND NOT `[net]`, and it is the only function in this module
+// with that row: a linger deadline is a clock read and nothing else.
+// True when a batch is full, or when the oldest one has waited
+// `linger_ms`.
+//
+// ```novo
+// use kafkaproducer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+//                                            kafkaproducer.default_config())
+//             println("${kafkaproducer.should_flush(p)}")         // false
+// ```
+pub fn should_flush(p: Kproducer) -> Bool [time]
+    todo("kafka-nv.kafkaproducer.should_flush")
+
+// Whether the linger has elapsed, given the current instant.
+//
+// The pure half of `should_flush`, so a test can drive a producer
+// through an hour of lingers in a loop without a clock.
+pub fn linger_elapsed(p: Kproducer, now_millis: Int) -> Bool
+    todo("kafka-nv.kafkaproducer.linger_elapsed")
+
+// Send everything buffered and collect the results.
+//
+// THE ONE FUNCTION IN THIS MODULE THAT TOUCHES A SOCKET.  Groups the
+// pending batches by leader, encodes a produce request per leader,
+// pipelines them, and answers a result per topic and partition.
+//
+// A result carries `base_offset` of `-1` and no error when `acks` is
+// `KproducerAckNone`, because the broker sends nothing back and there
+// is nothing to report.
+//
+// A retriable failure is retried up to `retries` times with the
+// configured backoff; a failure that needs a metadata refresh is
+// reported so the caller can refresh, because refreshing here would
+// mean this function also owned the cluster snapshot.
+//
+// ```novo
+// use kafkaproducer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+//                                            kafkaproducer.default_config())
+//             match kafkaproducer.flush(p)
+//                 Ok(f)  => println("${list.len(f.results)} partitions written")
+//                 Err(_) => println("the flush failed")
+// ```
+pub fn flush(p: Kproducer) -> Result<KproducerFlushed, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaproducer.flush")
+
+// Replace the producer's cluster snapshot.
+//
+// What a caller does after `kafkaconn.fetch_metadata`, when a `send`
+// or a `flush` said the metadata was stale.  `[]`, because it is an
+// assignment.
+pub fn with_cluster(p: Kproducer, cluster: kafkaconn.KconnCluster) -> Kproducer
+    todo("kafka-nv.kafkaproducer.with_cluster")
+
+// Throw away everything buffered.
+//
+// For a caller that has decided the records are no longer wanted — a
+// shutdown that must not block, a batch whose deadline has passed.
+// Answers how many records were dropped, because a program that
+// discards data should be able to say how much.
+pub fn discard(p: Kproducer) -> KproducerDiscarded
+    todo("kafka-nv.kafkaproducer.discard")
+
+// A producer and what discarding cost.
+pub struct KproducerDiscarded
+    producer: Kproducer
+    dropped: Int
+
+// Flush and close the connection.
+//
+// A producer that is closed without flushing loses whatever it was
+// holding, so this does both and reports what the flush produced.
+pub fn close(p: Kproducer) -> Result<KproducerFlushed, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaproducer.close")

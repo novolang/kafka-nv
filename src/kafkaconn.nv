@@ -1,0 +1,500 @@
+// kafkaconn.nv — the socket, the version handshake, and the two caches
+// a Kafka client cannot work without.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[net]` AND `[net, time]`, AND NOTHING ELSE.  `std.net`'s calls —
+// `net.connect`, `net.send_bytes`, `net.recv_bytes`, `net.close`,
+// `net.set_recv_timeout` — declare `[net]` alone, so a client built on
+// them costs `[net]`.  `[time]` appears on the calls that consult a
+// deadline or a cache age, which here means every call that waits for
+// a broker.  No module in this package prints, so there is no `[io]`.
+//
+// A CLIENT CANNOT TALK TO ONE BROKER.  A Kafka cluster is many
+// brokers, and each partition is led by exactly one of them; a produce
+// or a fetch sent to any other is refused with
+// `NOT_LEADER_OR_FOLLOWER`.  So a client needs the METADATA — the
+// broker list, and for each partition which broker leads it — before
+// it can send anything about a topic.  `KconnCluster` is that map, and
+// `fetch_metadata` is what fills it.
+//
+// AND A CONSUMER GROUP NEEDS A SECOND, DIFFERENT LOOKUP.  The broker
+// that coordinates a group is found with `FindCoordinator`, not with
+// `Metadata`; it has nothing to do with partition leadership, it moves
+// independently, and it goes stale independently.  Two caches, two
+// staleness questions, two refresh calls — which is why
+// `kafkaclienterror` has `needs_metadata_refresh` and
+// `needs_coordinator_refresh` as separate predicates.
+//
+// THE HANDSHAKE IS NOT OPTIONAL AND IT IS ONE ROUND TRIP.  `connect`
+// opens the socket; `handshake` sends `ApiVersions`, settles a version
+// per API with `kafkaapi.negotiate_all`, and stores the result in the
+// connection's exchange.  A client that skipped it and sent its newest
+// version of everything gets `UNSUPPORTED_VERSION` back from a broker
+// one release older — the same outcome, one round trip later, with the
+// connection already spent.  `connect_and_handshake` is the two
+// together, because nothing sensible happens between them.
+//
+// THE CONNECTION IS A VALUE AND EVERY CALL ANSWERS A NEW ONE.  The
+// exchange inside it is kafka-codec-nv's, and the exchange is
+// immutable: a `call` consumes a connection and answers the connection
+// as it now is, with the correlation counter advanced and the inbox
+// drained.  A caller that reused the old value would resend a
+// correlation id.
+//
+// TLS AND SASL ARE NOT HERE, AND `KconnTransport` IS WHERE THEY GO.
+// It has one arm today.  Kafka's TLS has no in-band negotiation — a
+// port is either TLS or it is not — so a TLS arm carries its
+// configuration and is used from the first byte.  SASL is a pair of
+// ordinary requests that kafka-codec-nv 0.0.1 does not encode, so it
+// is a later release of that package and then of this one.  Both are
+// in the README's "What is not included" rather than half-present
+// here.
+
+use std.net
+use kafkaapi
+use kafkaclienterror
+use kafkaframe
+use kafkarecords
+use kafkareq
+use kafkaresp
+
+// How bytes get to a broker.
+//
+// One arm today.  A `KconnTls` arm is what a TLS release adds; see the
+// module comment for why it is an enum rather than a struct of
+// function pointers.
+pub enum KconnTransport
+    // A plain TCP connection over `std.net`.
+    KconnPlaintext
+
+// Where a broker is, and which node it is.
+pub struct KconnAddress
+    host: Str
+    port: Int
+    // The broker's own id in the cluster, or `-1` for an address from
+    // the bootstrap list, which is given before any node id is known.
+    node_id: Int
+
+// What to connect as, and what to believe.
+pub struct KconnOptions
+    // The name this client is known by in a broker's logs, metrics and
+    // `kafka-client-metrics`.  A client that leaves it empty is one
+    // nobody can find when it is the one holding a partition.
+    client_id: Str
+    // Where to start.  Several addresses, because the point of a
+    // bootstrap list is that any one of them may be down; `bootstrap`
+    // tries them in order.
+    bootstrap: [KconnAddress]
+    transport: KconnTransport
+    connect_timeout_ms: Int
+    // How long to wait for a response before giving up on it.  Must be
+    // larger than a fetch's `max_wait_ms`, or every long poll
+    // disconnects itself — `check_options` says so.
+    request_timeout_ms: Int
+    // Refuse a frame larger than this.  A fetch response can
+    // legitimately be tens of megabytes, so the ceiling is the
+    // caller's.
+    max_frame_bytes: Int
+    // How long a metadata snapshot is trusted before it is refetched,
+    // even when nothing has failed.  Kafka's own clients use five
+    // minutes: a partition can move without any request failing, and a
+    // client that only refreshed on failure keeps sending to a broker
+    // that is about to stop leading.
+    metadata_max_age_ms: Int
+    // The compression functions this client may use, from flate-nv,
+    // snappy-nv, lz4-nv or zstd-nv.  Empty is correct for a program
+    // that produces and consumes uncompressed topics, and it links no
+    // compression library.
+    codecs: kafkarecords.KafkaCodecSet
+
+// One connection to one broker.
+pub struct Kconn
+    // `std.net`'s handle.  The only socket in this package.
+    sock: net.Sock
+    address: KconnAddress
+    options: KconnOptions
+    // kafka-codec-nv's protocol state: the correlation table, the
+    // negotiated versions and the undecoded inbox.
+    exchange: kafkaframe.KafkaExchange
+    // False until `handshake` has run.  A connection that has not
+    // handshaken may only send `ApiVersions`.
+    negotiated: Bool
+    // The broker's software version, from the `ApiVersions` reply.
+    // Carried because half of Kafka's behaviour differences are
+    // version differences, and a report that does not say the version
+    // is one nobody can act on.
+    broker_version: Str
+
+// What the cluster looks like, as of one `Metadata` reply.
+pub struct KconnCluster
+    brokers: [KconnAddress]
+    topics: [KconnTopic]
+    // The node that answers administrative requests, or `-1`.
+    controller_id: Int
+    cluster_id: Str
+    // When this snapshot was taken, in milliseconds since the Unix
+    // epoch.  Read by `is_stale`, which is `[]` and takes the current
+    // instant, so that a cache-age decision is testable without a
+    // clock.
+    fetched_at_millis: Int
+    // Which broker coordinates which group, from `FindCoordinator`.  A
+    // separate map from the topics for a separate lookup — see the
+    // module comment.
+    coordinators: [KconnCoordinator]
+
+// One topic in a cluster snapshot.
+pub struct KconnTopic
+    name: Str
+    // Empty before Kafka 2.8, which introduced topic ids.
+    topic_id: Str
+    is_internal: Bool
+    partitions: [KconnPartition]
+
+// One partition in a cluster snapshot.
+pub struct KconnPartition
+    index: Int
+    // The node id of the leader, or `-1` when there is none right now.
+    leader_id: Int
+    // The leader's epoch, echoed back in a fetch so the broker can
+    // detect a client reading from a log that was truncated by a
+    // leader change.
+    leader_epoch: Int
+    replica_nodes: [Int]
+    in_sync_nodes: [Int]
+
+// Which broker coordinates a group.
+pub struct KconnCoordinator
+    group_id: Str
+    address: KconnAddress
+    found_at_millis: Int
+
+// A connection and a reply.
+pub struct KconnReply
+    conn: Kconn
+    response: kafkaresp.KafkaResponse
+
+// A connection and several replies, in the order the requests went
+// out.
+pub struct KconnReplies
+    conn: Kconn
+    responses: [kafkaresp.KafkaResponse]
+
+// A connection and a fresh cluster snapshot.
+pub struct KconnClusterReply
+    conn: Kconn
+    cluster: KconnCluster
+
+// ── options ──────────────────────────────────────────────────────────
+
+// An address.
+//
+// `node_id` is `-1`, which is what a bootstrap address has: the
+// cluster's own numbering is not known until the first `Metadata`
+// reply.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     println("${kafkaconn.address("broker-1", 9092).port}")
+// ```
+pub fn address(host: Str, port: Int) -> KconnAddress
+    todo("kafka-nv.kafkaconn.address")
+
+// Sensible options for one local broker: 127.0.0.1 port 9092,
+// plaintext, a five-second connect deadline, a thirty-second request
+// deadline, a hundred-megabyte frame ceiling, a five-minute metadata
+// age and no compression codecs.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     println(kafkaconn.default_options("orders-indexer").client_id)
+// ```
+pub fn default_options(client_id: Str) -> KconnOptions
+    todo("kafka-nv.kafkaconn.default_options")
+
+// The same options with a bootstrap list.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+//                                      [kafkaconn.address("broker-1", 9092)])
+//     println("${list.len(o.bootstrap)}")
+// ```
+pub fn with_bootstrap(o: KconnOptions, brokers: [KconnAddress]) -> KconnOptions
+    todo("kafka-nv.kafkaconn.with_bootstrap")
+
+// The same options with compression codecs supplied.
+//
+// A program that reads or writes a compressed topic passes flate-nv's,
+// snappy-nv's, lz4-nv's or zstd-nv's functions here.  One that does
+// not links no compression library at all.
+pub fn with_codecs(o: KconnOptions, codecs: kafkarecords.KafkaCodecSet) -> KconnOptions
+    todo("kafka-nv.kafkaconn.with_codecs")
+
+// The same options with the two deadlines.
+pub fn with_timeouts(o: KconnOptions, connect_ms: Int, request_ms: Int) -> KconnOptions
+    todo("kafka-nv.kafkaconn.with_timeouts")
+
+// The fault in an unusable set of options, or `None`.
+//
+// Run at start-up, where the message can name the field.  Catches an
+// empty bootstrap list, a request timeout that is not larger than a
+// fetch's longest poll, a frame ceiling below Kafka's own minimum, and
+// a metadata age of zero, which would refetch before every request.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     match kafkaconn.check_options(kafkaconn.default_options("novo"))
+//         Some(_) => println("unusable")
+//         None    => println("usable")
+// ```
+pub fn check_options(o: KconnOptions) -> ?kafkaclienterror.KclientFault
+    todo("kafka-nv.kafkaconn.check_options")
+
+// ── connecting ───────────────────────────────────────────────────────
+
+// Open a socket to one broker.
+//
+// Does NOT handshake: the connection may only send `ApiVersions` until
+// `handshake` has run.  The two are separate calls because a tool that
+// wants to know what a broker speaks and nothing else stops after the
+// first.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.connect(kafkaconn.default_options("novo"),
+//                             kafkaconn.address("127.0.0.1", 9092))
+//         Ok(_)  => println("connected")
+//         Err(_) => println("could not connect")
+// ```
+pub fn connect(o: KconnOptions,
+               a: KconnAddress) -> Result<Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.connect")
+
+// Send `ApiVersions` and settle a version per API.
+//
+// One round trip, and the client is useless without it — see the
+// module comment.  A broker that refuses even the `ApiVersions`
+// version sent is retried at v0, which every broker since 0.10 speaks.
+pub fn handshake(c: Kconn) -> Result<Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.handshake")
+
+// Connect and handshake.
+//
+// Nothing sensible happens between them, so this is what a client
+// calls.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.connect_and_handshake(kafkaconn.default_options("novo"),
+//                                           kafkaconn.address("127.0.0.1", 9092))
+//         Ok(c)  => println("broker ${c.broker_version}")
+//         Err(_) => println("no broker there")
+// ```
+pub fn connect_and_handshake(o: KconnOptions,
+                             a: KconnAddress) -> Result<Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.connect_and_handshake")
+
+// Try every address in the bootstrap list until one answers.
+//
+// The whole point of a bootstrap list is that any one of its entries
+// may be down, so a client that tried only the first would be as
+// available as its least available broker.  Answers
+// `KclientNoBroker` carrying how many were tried, rather than the
+// last one's message, because "none of three answered" is the useful
+// sentence.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Ok(_)  => println("connected to one of them")
+//         Err(_) => println("none of them answered")
+// ```
+pub fn bootstrap(o: KconnOptions) -> Result<Kconn, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.bootstrap")
+
+// Close the socket.
+pub fn close(c: Kconn) -> ?kafkaclienterror.KclientFault [net]
+    todo("kafka-nv.kafkaconn.close")
+
+// Whether the handshake has run.
+pub fn is_ready(c: Kconn) -> Bool
+    todo("kafka-nv.kafkaconn.is_ready")
+
+// Which version this connection will send a request at.
+//
+// The negotiated one after the handshake.  A caller asks when it needs
+// to know whether a field it wants to set will survive the encode —
+// `kafkareq.check_encodable` is the other half of that question.
+pub fn protocol_version(c: Kconn, k: kafkaapi.KafkaApiKey) -> Int
+    todo("kafka-nv.kafkaconn.protocol_version")
+
+// ── exchanging ───────────────────────────────────────────────────────
+
+// Send one request and wait for its reply.
+//
+// Writes what `kafkaframe.send` produced, reads until
+// `kafkaframe.drain` answers a response, and answers the connection as
+// it now is.  A caller that reused the old connection value would
+// resend a correlation id — see the module comment.
+//
+// ```novo
+// use kafkaconn
+// use kafkareq
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             match kafkaconn.call(c, KafkaMetadataReq(kafkareq.metadata_for_all_topics()))
+//                 Ok(_)  => println("the cluster answered")
+//                 Err(_) => println("it did not")
+// ```
+pub fn call(c: Kconn,
+            r: kafkareq.KafkaRequest) -> Result<KconnReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.call")
+
+// Send a request that expects no reply.
+//
+// The one request in the protocol like that is a `Produce` with
+// `acks = 0`.  A separate function rather than a `call` that sometimes
+// does not wait, so that the fire-and-forget is visible at the call
+// site — and `[net]` rather than `[net, time]`, because there is no
+// deadline to consult when nothing is awaited.
+pub fn send_only(c: Kconn,
+                 r: kafkareq.KafkaRequest) -> Result<Kconn, kafkaclienterror.KclientFault> [net]
+    todo("kafka-nv.kafkaconn.send_only")
+
+// Send several requests in one write and read all their replies.
+//
+// THE LARGEST THROUGHPUT DECISION A KAFKA CLIENT MAKES, and it is one
+// function.  N requests in one write and N replies in one read turns N
+// round trips into one; over a network with a millisecond of latency
+// that is the difference between a thousand requests a second and a
+// hundred thousand.  A broker answers one connection's requests in
+// order, so the replies come back in the order they were sent.
+pub fn pipeline(c: Kconn,
+                requests: [kafkareq.KafkaRequest]) -> Result<KconnReplies, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.pipeline")
+
+// ── the two caches ───────────────────────────────────────────────────
+
+// An empty cluster snapshot.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     println("${list.len(kafkaconn.empty_cluster().brokers)}")   // 0
+// ```
+pub fn empty_cluster() -> KconnCluster
+    todo("kafka-nv.kafkaconn.empty_cluster")
+
+// Ask a broker for the metadata of some topics, or of all of them.
+//
+// An EMPTY topic list asks for every topic in the cluster, because
+// that is what `kafkareq.metadata_for_all_topics` sends — and a caller
+// that wanted none would not be calling this.
+pub fn fetch_metadata(c: Kconn,
+                      topics: [Str]) -> Result<KconnClusterReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.fetch_metadata")
+
+// Merge a fresh snapshot into an older one, keeping the coordinators.
+//
+// `[]`, so a client's cache policy is testable without a cluster.  The
+// coordinators survive because they came from a different request and
+// a `Metadata` reply says nothing about them.
+pub fn merge_cluster(old: KconnCluster, fresh: KconnCluster) -> KconnCluster
+    todo("kafka-nv.kafkaconn.merge_cluster")
+
+// Whether a snapshot is older than the options allow.
+//
+// Takes the current instant rather than reading a clock, so that a
+// cache-age decision is a pure function and a test can drive one
+// through a day in a loop.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     println("${kafkaconn.is_stale(kafkaconn.empty_cluster(), 1789000000000, 300000)}")
+// ```
+pub fn is_stale(cl: KconnCluster, now_millis: Int, max_age_ms: Int) -> Bool
+    todo("kafka-nv.kafkaconn.is_stale")
+
+// Which broker leads a partition, or `None`.
+//
+// `None` for a partition with no leader right now as well as for one
+// the snapshot does not name, because both mean the same thing to a
+// caller: refresh and retry.
+//
+// ```novo
+// use kafkaconn
+//
+// fn main() [io]
+//     match kafkaconn.leader_for(kafkaconn.empty_cluster(), "orders", 0)
+//         Some(_) => println("send it there")
+//         None    => println("refresh the metadata first")
+// ```
+pub fn leader_for(cl: KconnCluster, topic: Str, partition: Int) -> ?KconnAddress
+    todo("kafka-nv.kafkaconn.leader_for")
+
+// How many partitions a topic has in this snapshot, or `None`.
+//
+// What a producer's partitioner needs before it can hash a key —
+// which is why a produce to an unknown topic is a metadata refresh and
+// not a failure.
+pub fn partition_count(cl: KconnCluster, topic: Str) -> ?Int
+    todo("kafka-nv.kafkaconn.partition_count")
+
+// The leader epoch of a partition, or `-1`.
+//
+// Sent back in a fetch so the broker can refuse a read from a log its
+// leader change truncated — `KafkaErrFencedLeaderEpoch`.
+pub fn leader_epoch(cl: KconnCluster, topic: Str, partition: Int) -> Int
+    todo("kafka-nv.kafkaconn.leader_epoch")
+
+// Every broker in the snapshot.
+pub fn brokers_of(cl: KconnCluster) -> [KconnAddress]
+    todo("kafka-nv.kafkaconn.brokers_of")
+
+// Every partition index of a topic in the snapshot.
+//
+// What a consumer subscribing to a topic turns into an assignment, and
+// what an administrative report iterates.
+pub fn partitions_of(cl: KconnCluster, topic: Str) -> [Int]
+    todo("kafka-nv.kafkaconn.partitions_of")
+
+// Ask which broker coordinates a group.
+//
+// `FindCoordinator`, not `Metadata` — the second of the two lookups.
+pub fn find_coordinator(c: Kconn,
+                        group_id: Str) -> Result<KconnClusterReply, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconn.find_coordinator")
+
+// Which broker coordinates a group in this snapshot, or `None`.
+pub fn coordinator_for(cl: KconnCluster, group_id: Str) -> ?KconnAddress
+    todo("kafka-nv.kafkaconn.coordinator_for")
+
+// Drop a group's coordinator from the snapshot.
+//
+// What a client does on `KafkaErrNotCoordinator`, so the next call
+// looks it up again.  A separate operation from a metadata refresh,
+// because refreshing everything on a coordinator move would refetch a
+// cluster's worth of partition data to learn one address.
+pub fn forget_coordinator(cl: KconnCluster, group_id: Str) -> KconnCluster
+    todo("kafka-nv.kafkaconn.forget_coordinator")

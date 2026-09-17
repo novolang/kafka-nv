@@ -1,0 +1,512 @@
+// kafkaconsumer.nv — the fetch loop, the position, and the two
+// decisions a consumer cannot avoid making.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A CONSUMER IS A POSITION AND A LOOP.  It holds, per partition, the
+// offset it will read next; it asks the leader for records from there;
+// it advances.  Everything else — the group, the commits, the resets —
+// is about where that position comes from and where it is remembered.
+//
+// THE FIRST DECISION IS WHAT TO DO WITH NO POSITION, AND THERE IS NO
+// SAFE DEFAULT.  A new group has committed nothing; a group whose
+// committed offset has aged out of the retention window has a position
+// the log no longer holds.  Starting at the beginning replays
+// everything, which for a topic with a month of retention can mean
+// reprocessing a month of work.  Starting at the end skips whatever
+// arrived while the consumer was away, which for an order stream means
+// losing orders.  Both are catastrophic in some deployment and correct
+// in another, so `KconsumerReset` has no default this package picks:
+// `KconsumerRefuse` is a third arm that answers
+// `KclientOffsetUnknown` and makes the caller decide once, at
+// start-up, with the fact in front of it.
+//
+// THE SECOND DECISION IS WHEN TO COMMIT, AND IT DECIDES THE DELIVERY
+// GUARANTEE.  Committing before processing is at-most-once: a crash
+// loses the records in flight.  Committing after processing is
+// at-least-once: a crash reprocesses them.  There is no third option
+// without a transaction, and this release has no transactions.  So
+// `auto_commit` is off in `default_config`, `commit` is an explicit
+// call, and the README says which guarantee each choice gives rather
+// than leaving it to a configuration file.
+//
+// A FETCH IS A LONG POLL AND THE DEADLINES MUST NOT CROSS.  A fetch
+// with `max_wait_ms` of five hundred occupies the connection for up to
+// half a second waiting for `min_bytes` to arrive.  A connection whose
+// request timeout is shorter disconnects itself and reconnects, having
+// fetched nothing, forever.  `check_config` compares the two, because
+// that arithmetic is the trap every Kafka client eventually writes and
+// most write once, wrongly.
+//
+// THE POSITION IS THE NEXT OFFSET, EVERYWHERE.  `KconsumerPosition`
+// holds the offset that will be read next, `commit` sends that, and
+// `kafkagroup.KgroupOffset` means the same thing.  A client that
+// committed the last offset it processed reprocesses one record per
+// partition after every restart, which is the most common off-by-one
+// in the field and the reason every type in this package says which it
+// is.
+//
+// HEARTBEATS ARE THE CALLER'S, AND THAT IS A DELIBERATE ABSENCE.  A
+// member that stops heartbeating for its session timeout is evicted.
+// Most clients solve that with a background thread; this package
+// declares no `[async]` and starts no task, so `poll` heartbeats on
+// the way past and `heartbeat_due` says when one is owed.  A consumer
+// whose processing takes longer than the session timeout must call
+// `kafkagroup.heartbeat` itself — and the README says so, because
+// discovering it from a rebalance loop in production is the
+// alternative.
+
+use kafkaclienterror
+use kafkaconn
+use kafkagroup
+use kafkarecords
+
+// What to do about a partition with no usable position.
+//
+// No default: see the module comment.
+//
+// ```novo
+// use kafkaconsumer
+//
+// fn main() [io]
+//     println(kafkaconsumer.reset_name(KconsumerEarliest))   // earliest
+// ```
+pub enum KconsumerReset
+    // Start at the earliest offset the log still holds.  Replays
+    // everything within the retention window.
+    KconsumerEarliest
+    // Start at the offset one past the last record.  Skips whatever
+    // arrived while there was no consumer.
+    KconsumerLatest
+    // Answer `KclientOffsetUnknown` and let the program decide.  The
+    // right choice for a consumer whose correctness depends on which
+    // of the other two would have happened.
+    KconsumerRefuse
+
+// What a consumer reads, and how.
+pub struct KconsumerConfig
+    // The group this consumer belongs to.  Empty for a consumer that
+    // manages its own positions and joins no group — which is what a
+    // one-off reader or a repair tool wants.
+    group_id: Str
+    topics: [Str]
+    // How long a broker may hold a fetch open waiting for
+    // `min_bytes`.  THE LONG POLL — see the module comment.
+    max_wait_ms: Int
+    // How many bytes must be available before the broker answers.  `1`
+    // means "answer as soon as there is anything".
+    min_bytes: Int
+    // The ceiling on a whole fetch response.
+    max_bytes: Int
+    // The ceiling per partition, so one busy partition cannot fill
+    // every response and starve the others.
+    partition_max_bytes: Int
+    // Whether to skip the records of transactions that have not
+    // committed.  `true` is `read_committed`.
+    read_committed: Bool
+    auto_offset_reset: KconsumerReset
+    // Whether `poll` commits the previous batch's positions on the way
+    // past.  Off in `default_config`: it makes the delivery guarantee
+    // at-most-once and that is a decision a program should make
+    // deliberately.
+    auto_commit: Bool
+    auto_commit_interval_ms: Int
+    // How long the coordinator waits for a heartbeat before evicting
+    // this member.
+    session_timeout_ms: Int
+    // How long the coordinator waits for this member to rejoin during
+    // a rebalance.  Must exceed the longest time the program spends
+    // between polls, or a slow batch triggers the rebalance it is
+    // trying to survive.
+    rebalance_timeout_ms: Int
+
+// Where a consumer is in one partition.
+pub struct KconsumerPosition
+    topic: Str
+    partition: Int
+    // THE NEXT OFFSET TO READ — see the module comment.
+    next_offset: Int
+    // The offset one past the last record the leader holds, from the
+    // last fetch.  `-1` before the first one.
+    high_watermark: Int
+    // The leader epoch this position was read in, or `-1`.  Sent back
+    // in the fetch so the broker can refuse a read from a truncated
+    // log.
+    leader_epoch: Int
+
+// One record, with everything a handler needs to act on it.
+pub struct KconsumerRecord
+    topic: Str
+    partition: Int
+    // The absolute offset, not the delta the batch carried.
+    offset: Int
+    // Milliseconds since the Unix epoch, resolved against the batch's
+    // base and its timestamp type.
+    timestamp_millis: Int
+    key: Bytes
+    key_is_null: Bool
+    value: Bytes
+    // A null value is a tombstone on a compacted topic.  A handler
+    // that treated it as an empty message would write an empty record
+    // where a deletion belongs.
+    value_is_null: Bool
+    headers: [kafkarecords.KafkaRecordHeader]
+
+// A consumer: a connection, a membership and a set of positions.
+pub struct Kconsumer
+    conn: kafkaconn.Kconn
+    cluster: kafkaconn.KconnCluster
+    config: KconsumerConfig
+    // Empty for a consumer that joined no group.
+    membership: kafkagroup.KgroupMembership
+    positions: [KconsumerPosition]
+    // When the last commit went out, in milliseconds since the Unix
+    // epoch, for the automatic commit interval.
+    last_commit_millis: Int
+    // When the last heartbeat went out.
+    last_heartbeat_millis: Int
+    closed: Bool
+
+// What a poll produced.
+pub struct KconsumerPolled
+    consumer: Kconsumer
+    // In partition order, and within a partition in offset order.
+    // Across partitions there is no order, because Kafka guarantees
+    // none.
+    records: [KconsumerRecord]
+    // True when the group rebalanced during this poll, in which case
+    // the previous assignment's records must not be committed: the
+    // partitions belong to somebody else now.
+    rebalanced: Bool
+
+// ── configuration, all of it pure ────────────────────────────────────
+
+// A configuration for the ordinary case: a five-hundred-millisecond
+// long poll, one byte minimum, a fifty-megabyte response ceiling, a
+// one-megabyte partition ceiling, read uncommitted, refuse to guess a
+// missing position, no automatic commit, a forty-five-second session
+// and a five-minute rebalance timeout.
+//
+// The reset policy is `KconsumerRefuse` because there is no safe
+// default — see the module comment.  `auto_commit` is off because
+// leaving it on chooses at-most-once delivery on the program's behalf.
+//
+// ```novo
+// use kafkaconsumer
+//
+// fn main() [io]
+//     println("${kafkaconsumer.default_config("indexers", ["orders"]).max_wait_ms}")
+// ```
+pub fn default_config(group_id: Str, topics: [Str]) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.default_config")
+
+// A configuration for a consumer that joins no group and keeps its own
+// positions.
+//
+// For a repair tool, a one-off reader, a test.  Nothing is committed
+// anywhere, `seek` is the only way a position is set, and no rebalance
+// can take a partition away.
+//
+// ```novo
+// use kafkaconsumer
+//
+// fn main() [io]
+//     println(kafkaconsumer.standalone_config(["orders"]).group_id)   // (empty)
+// ```
+pub fn standalone_config(topics: [Str]) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.standalone_config")
+
+// The same configuration with a reset policy.
+pub fn with_auto_offset_reset(c: KconsumerConfig, r: KconsumerReset) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.with_auto_offset_reset")
+
+// The same configuration reading only committed records.
+//
+// A `read_committed` consumer skips the records of open and aborted
+// transactions, and therefore stops at the last stable offset rather
+// than at the high watermark — so its lag never reaches zero while a
+// transaction is open, which looks like a stall and is not.
+pub fn with_read_committed(c: KconsumerConfig, on: Bool) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.with_read_committed")
+
+// The same configuration with automatic commit on or off.
+//
+// On makes the delivery guarantee at-most-once: `poll` commits the
+// previous batch before the program has finished with it, so a crash
+// loses whatever was in flight.
+pub fn with_auto_commit(c: KconsumerConfig, on: Bool, interval_ms: Int) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.with_auto_commit")
+
+// The same configuration with a fetch window.
+pub fn with_fetch_window(c: KconsumerConfig, max_wait_ms: Int, min_bytes: Int,
+                         max_bytes: Int) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.with_fetch_window")
+
+// The same configuration with the two group timeouts.
+pub fn with_group_timeouts(c: KconsumerConfig, session_timeout_ms: Int,
+                           rebalance_timeout_ms: Int) -> KconsumerConfig
+    todo("kafka-nv.kafkaconsumer.with_group_timeouts")
+
+// The fault in an unusable configuration, or `None`.
+//
+// Compares the fetch's longest poll against the connection's request
+// timeout — the crossing deadlines of the module comment — and catches
+// an empty topic list, a partition ceiling above the response ceiling,
+// a commit interval longer than the session timeout, and automatic
+// commit on a consumer with no group.
+//
+// ```novo
+// use kafkaconsumer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             match kafkaconsumer.check_config(
+//                       kafkaconsumer.default_config("indexers", ["orders"]), c)
+//                 Some(_) => println("unusable")
+//                 None    => println("usable")
+// ```
+pub fn check_config(c: KconsumerConfig, conn: kafkaconn.Kconn) -> ?kafkaclienterror.KclientFault
+    todo("kafka-nv.kafkaconsumer.check_config")
+
+// The name a reset policy has in Kafka's own configuration:
+// `"earliest"`, `"latest"`, `"none"`.
+//
+// `KconsumerRefuse` is `"none"`, which is what
+// `auto.offset.reset=none` means in a broker-side configuration file,
+// so a caller reading one can pass the value straight through.
+pub fn reset_name(r: KconsumerReset) -> Str
+    todo("kafka-nv.kafkaconsumer.reset_name")
+
+// The reset policy a configuration name denotes, or `None`.
+pub fn reset_named(name: Str) -> ?KconsumerReset
+    todo("kafka-nv.kafkaconsumer.reset_named")
+
+// ── the consumer ─────────────────────────────────────────────────────
+
+// A consumer over a connection and a cluster snapshot.
+//
+// Joins nothing yet: `subscribe` is what enters the group.
+pub fn consumer(c: kafkaconn.Kconn, cluster: kafkaconn.KconnCluster,
+                config: KconsumerConfig) -> Kconsumer
+    todo("kafka-nv.kafkaconsumer.consumer")
+
+// Join the group and take an assignment.
+//
+// Finds the coordinator, joins, computes the assignment if this member
+// is the leader, syncs, and reads the group's committed offsets into
+// the positions.  A partition the group has never committed gets its
+// position from the reset policy — or `KclientOffsetUnknown` under
+// `KconsumerRefuse`.
+//
+// A consumer with no group id skips all of it and sets no positions:
+// `seek` is the only way in for a standalone consumer.
+//
+// ```novo
+// use kafkaconsumer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let k = kafkaconsumer.consumer(c, kafkaconn.empty_cluster(),
+//                        kafkaconsumer.default_config("indexers", ["orders"]))
+//             match kafkaconsumer.subscribe(k)
+//                 Ok(k2) => println("${list.len(kafkaconsumer.assignment(k2))} partitions")
+//                 Err(_) => println("could not join")
+// ```
+pub fn subscribe(k: Kconsumer) -> Result<Kconsumer, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.subscribe")
+
+// Fetch once and advance the positions.
+//
+// One fetch per leader, pipelined, covering every assigned partition
+// that leader holds.  Heartbeats on the way past if one is due, and
+// answers `rebalanced` when the coordinator said the group is
+// rebalancing — in which case the records of the previous assignment
+// must not be committed, because those partitions are somebody else's
+// now.
+//
+// An empty record list is the ordinary answer on a quiet topic and is
+// not an error: the long poll waited `max_wait_ms` and nothing
+// arrived.
+//
+// ```novo
+// use kafkaconsumer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let k = kafkaconsumer.consumer(c, kafkaconn.empty_cluster(),
+//                        kafkaconsumer.default_config("indexers", ["orders"]))
+//             match kafkaconsumer.poll(k)
+//                 Ok(p)  => println("${list.len(p.records)} records")
+//                 Err(_) => println("the fetch failed")
+// ```
+pub fn poll(k: Kconsumer) -> Result<KconsumerPolled, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.poll")
+
+// Commit the current positions for the group.
+//
+// AT-LEAST-ONCE IS COMMITTING AFTER PROCESSING — see the module
+// comment.  Carries the generation, so a commit from a member the
+// group has moved past is refused rather than overwriting the position
+// of whoever took its partitions.
+//
+// Refused for a consumer with no group id: there is nowhere to put
+// them.
+pub fn commit(k: Kconsumer) -> Result<Kconsumer, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.commit")
+
+// Commit particular positions rather than the current ones.
+//
+// For a program that has processed some partitions and not others, and
+// for one that batches its work differently from its polls.
+pub fn commit_positions(k: Kconsumer,
+                        positions: [KconsumerPosition]) -> Result<Kconsumer, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.commit_positions")
+
+// Read the group's stored positions from the coordinator.
+//
+// Not the consumer's own positions, which are in memory and ahead of
+// these: what a restart would resume from.  The difference between the
+// two is how much work a crash would repeat.
+pub fn committed(k: Kconsumer) -> Result<KconsumerCommitted, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.committed")
+
+// A consumer and the positions its group has stored.
+pub struct KconsumerCommitted
+    consumer: Kconsumer
+    positions: [KconsumerPosition]
+
+// Whether a heartbeat is owed.
+//
+// `[time]`, because it is a clock read against
+// `last_heartbeat_millis` and nothing else.  A consumer whose
+// processing takes longer than the session timeout must call
+// `kafkagroup.heartbeat` itself — this package starts no background
+// task, and the README says so.
+pub fn heartbeat_due(k: Kconsumer) -> Bool [time]
+    todo("kafka-nv.kafkaconsumer.heartbeat_due")
+
+// ── positions ────────────────────────────────────────────────────────
+
+// Every position the consumer holds.
+pub fn positions(k: Kconsumer) -> [KconsumerPosition]
+    todo("kafka-nv.kafkaconsumer.positions")
+
+// Every partition the consumer is assigned, with its position.
+//
+// The same list as `positions` for a subscribed consumer, and the
+// distinction matters after a rebalance: the assignment is what the
+// group says this member holds now, and a position for a partition
+// that is no longer assigned is stale.
+pub fn assignment(k: Kconsumer) -> [KconsumerPosition]
+    todo("kafka-nv.kafkaconsumer.assignment")
+
+// Where the consumer will read next in one partition, or `None`.
+pub fn position_of(k: Kconsumer, topic: Str, partition: Int) -> ?Int
+    todo("kafka-nv.kafkaconsumer.position_of")
+
+// How far behind the leader the consumer is in one partition, or
+// `None`.
+//
+// The high watermark minus the next offset: THE NUMBER EVERY KAFKA
+// DASHBOARD SHOWS.  `None` before the first fetch of that partition,
+// because the high watermark arrives with records and a consumer that
+// has fetched nothing does not know it.
+//
+// ```novo
+// use kafkaconsumer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let k = kafkaconsumer.consumer(c, kafkaconn.empty_cluster(),
+//                        kafkaconsumer.default_config("indexers", ["orders"]))
+//             match kafkaconsumer.lag_of(k, "orders", 0)
+//                 Some(n) => println("${n} behind")
+//                 None    => println("nothing fetched from that partition yet")
+// ```
+pub fn lag_of(k: Kconsumer, topic: Str, partition: Int) -> ?Int
+    todo("kafka-nv.kafkaconsumer.lag_of")
+
+// Set the position of one partition.
+//
+// `[]`: it changes a number in memory and nothing else.  The next
+// `poll` reads from there.
+//
+// ```novo
+// use kafkaconsumer
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             let k = kafkaconsumer.consumer(c, kafkaconn.empty_cluster(),
+//                        kafkaconsumer.standalone_config(["orders"]))
+//             println("${list.len(kafkaconsumer.seek(k, "orders", 0, 41000).positions)}")
+// ```
+pub fn seek(k: Kconsumer, topic: Str, partition: Int, offset: Int) -> Kconsumer
+    todo("kafka-nv.kafkaconsumer.seek")
+
+// Move every assigned partition to the earliest offset the log still
+// holds.
+//
+// `[net, time]` because the earliest offset is a question for the
+// broker — `ListOffsets` — and not a number the consumer has.
+pub fn seek_to_beginning(k: Kconsumer) -> Result<Kconsumer, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.seek_to_beginning")
+
+// Move every assigned partition to one past the last record.
+pub fn seek_to_end(k: Kconsumer) -> Result<Kconsumer, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.seek_to_end")
+
+// Move every assigned partition to the first record at or after an
+// instant, in milliseconds since the Unix epoch.
+//
+// What a replay from a moment in time is.  A partition with no record
+// that late is left where it is, because there is nothing to seek to.
+pub fn seek_to_time(k: Kconsumer,
+                    unix_millis: Int) -> Result<Kconsumer, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkaconsumer.seek_to_time")
+
+// Turn one record batch into records, with absolute offsets and
+// resolved timestamps.
+//
+// `[]`, and public because it is the whole of what `poll` does to what
+// a fetch returned.  A tool reading log segments off disk has batches
+// and no consumer, and this is what it needs.
+pub fn records_of_batch(b: kafkarecords.KafkaRecordBatch, topic: Str,
+                        partition: Int) -> [KconsumerRecord]
+    todo("kafka-nv.kafkaconsumer.records_of_batch")
+
+// The positions those records imply: one past the last offset of each
+// partition.
+//
+// `[]`, and the function that keeps the off-by-one in one place — see
+// the module comment.  A caller committing after processing passes
+// what it processed and gets what to commit.
+pub fn positions_after(records: [KconsumerRecord]) -> [KconsumerPosition]
+    todo("kafka-nv.kafkaconsumer.positions_after")
+
+// Replace the consumer's cluster snapshot.
+pub fn with_cluster(k: Kconsumer, cluster: kafkaconn.KconnCluster) -> Kconsumer
+    todo("kafka-nv.kafkaconsumer.with_cluster")
+
+// Leave the group and close the connection.
+//
+// Commits nothing on the way out: a consumer that committed at close
+// would turn a shutdown in the middle of a batch into a silent skip of
+// that batch.  A caller that wants the positions stored calls `commit`
+// first.
+pub fn close(k: Kconsumer) -> ?kafkaclienterror.KclientFault [net, time]
+    todo("kafka-nv.kafkaconsumer.close")

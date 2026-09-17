@@ -1,0 +1,85 @@
+[package]
+name        = "kafka-nv"
+version     = "0.0.1"
+description = "An Apache Kafka client over kafka-codec-nv and std.net: connections with version negotiation and a metadata cache, a producer whose `send` only buffers and whose `flush` is the one call that touches a socket, a consumer with group membership, offset commit and an explicit reset policy, and the administrative reads a broker answers over Metadata and ListOffsets.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the split inside it is what the package is for.
+#
+# `kafkaclienterror` and `kafkagroup` are `[]` almost throughout.  The
+# first is a taxonomy.  The second is a MEMBERSHIP STATE MACHINE — the
+# member id, the generation, whether this member is the leader, the
+# subscription and assignment encodings, and the leader's assignment
+# computation — and not one of those needs a socket.  `kafkagroup.join`
+# and its three siblings are the only functions in that module that
+# declare `[net, time]`, because they are the ones that exchange the
+# state with a coordinator.
+#
+# `kafkaproducer` is `[]` for everything except `flush`, `close` and
+# `should_flush`, and that is the package's load-bearing decision.
+# `kafkaproducer.send` DOES NOT SEND: it partitions the message,
+# appends it to a batch and answers whether the batch must now go out.
+# So the whole of a producer's batching — the partitioner, the size
+# ceilings, the compression choice, the record that is too large — is
+# pure, testable with no cluster, and deterministic.  `flush` is the
+# one call that writes to a socket, and `should_flush` declares
+# `[time]` alone because a linger deadline is a clock read and nothing
+# else.
+#
+# `kafkaconn`, `kafkaconsumer` and `kafkaadmin` are the half that
+# connects.  They declare `[net]`, and `[net, time]` where a deadline
+# or a cache age is consulted — which for Kafka means every call that
+# waits on a broker, because a fetch is a long poll and a heartbeat is
+# a deadline.  Nothing here declares `[io]`, `[fs]` or `[rand]`: no
+# module prints, none reads a configuration file, and the one place a
+# client would ordinarily want randomness — a retry backoff's jitter —
+# takes the jitter from the caller instead, so that a test replays a
+# retry sequence exactly.
+#
+# The protocol half is a PACKAGE split and not a module split, unlike
+# postgres-nv and redis-nv, and the reason is that the second caller
+# already exists: kafka-codec-nv is a `core` package of its own because
+# a Kafka wire codec serves a broker test double, a protocol-aware
+# proxy and a log-segment reader as well as this client, and none of
+# those wants a socket.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["kafka", "producer", "consumer", "consumer-group", "client", "messaging", "streaming", "native-port"]
+repository  = "https://github.com/novolang/kafka-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.9.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "A Kafka client whose producer buffers and whose flush is the only call that writes"
+
+[dependencies]
+# kafka-codec-nv supplies the whole wire protocol: the request and
+# response values, the record batch, and the `KafkaExchange` state
+# machine this package pumps.  Every byte that leaves a socket here
+# came from `kafkaframe.send` and every byte that arrives goes to
+# `kafkaframe.feed`, so this package contains no encoder and no decoder
+# of its own — which is what keeps the two testable separately, the
+# codec against captured frames with no cluster and this package
+# against a codec it does not have to re-verify.
+#
+# A PATH DEPENDENCY WHILE THE TWO ARE STAGED, and it becomes the
+# registry range `^0.0.1` at the publish: `^0.0.1` pins exactly 0.0.1,
+# which is the right pin for an interface release, and a path
+# dependency in a published tarball sends a consumer to a directory
+# that does not exist.  `novo pkg publish` refuses a path dependency
+# for that reason, so the publish dry-run for this package cannot pass
+# until kafka-codec-nv is on the registry and this line is rewritten.
+# The CHANGELOG's Known section says so.
+kafka-codec-nv = { path = "../kafka-codec-nv" }

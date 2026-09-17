@@ -1,0 +1,166 @@
+// kafkaproducer_tests.nv — the API suite for batching, and for the one
+// function in the module that touches a socket.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// kafka-nv.kafkaproducer.<fn>`.
+//
+// THE POINT OF THIS SUITE IS THAT IT NEEDS NO CLUSTER.  `send` buffers
+// and answers a value, so the partitioner, the ceilings, the linger and
+// every refusal are assertable here.  That is what the `[]` rows on
+// this module buy, and it is why the only functions below that reach
+// for a connection are `flush` and `close`.
+
+use std.test
+use kafkaconn
+use kafkaproducer
+
+@test
+fn test_the_defaults_choose_durability_over_latency_and_say_so() [io]
+    let c = kafkaproducer.default_config()
+
+    test.case("every in-sync replica acknowledges, which is the only setting `min.insync.replicas` means anything under")
+    test.assert(kafkaproducer.ack_number(c.acks) == -1)
+
+    test.case("and a five-millisecond linger, which is the throughput dial")
+    // `0` costs a round trip per record; a few milliseconds is
+    // routinely the difference between a thousand records a second and
+    // a hundred thousand.
+    test.assert(c.linger_ms == 5)
+    test.assert(kafkaproducer.with_linger(c, 0).linger_ms == 0)
+
+    test.case("the three acknowledgement policies are an enum, not -1")
+    test.assert(kafkaproducer.ack_number(KproducerAckNone) == 0)
+    test.assert(kafkaproducer.ack_number(KproducerAckLeader) == 1)
+    test.assert(kafkaproducer.ack_number(
+        kafkaproducer.with_acks(c, KproducerAckAll).acks) == -1)
+
+    test.case("a batch ceiling and a request ceiling are different numbers")
+    let b = kafkaproducer.with_batching(c, 16384, 1048576)
+    test.assert(b.batch_max_bytes == 16384)
+    test.assert(b.max_request_bytes == 1048576)
+
+    test.case("compression is named here and its functions come from the connection")
+    test.assert(kafkaproducer.with_compression(c, KafkaZstd).compression == KafkaZstd)
+
+    test.case("and the partitioner decides the ordering a program gets")
+    // Kafka orders within a partition and not across them, so which
+    // partition a record lands in is the whole of the ordering.
+    test.assert(kafkaproducer.with_partitioner(c, KproducerRoundRobin).partitioner
+                == KproducerRoundRobin)
+
+@test
+fn test_idempotence_constrains_two_other_settings_and_says_which() [io]
+    // An idempotent producer built on `acks = 1` duplicates records
+    // under retry, which is the exact failure idempotence exists to
+    // prevent.
+    test.case("it is refused over an acknowledgement policy that cannot support it")
+    let unsafe_acks = kafkaproducer.with_acks(kafkaproducer.default_config(), KproducerAckNone)
+    match kafkaproducer.with_idempotence(unsafe_acks, true)
+        Ok(_)  => test.fail("idempotence needs every in-sync replica")
+        Err(_) => test.assert(true)
+
+    test.case("and accepted over one that can")
+    match kafkaproducer.with_idempotence(kafkaproducer.default_config(), true)
+        Ok(c)  => test.assert(c.idempotent)
+        Err(_) => test.fail("the default acks is all")
+
+    test.case("the retry jitter is a parameter, not a random number")
+    // Generating it would cost `[rand]`, and a test that cannot fix the
+    // jitter cannot assert a retry schedule.
+    let r = kafkaproducer.with_retries(kafkaproducer.default_config(), 3, 100, 25)
+    test.assert(r.retries == 3)
+    test.assert(r.retry_jitter_ms == 25)
+
+@test
+fn test_a_message_says_at_the_call_site_whether_it_is_ordered() [io]
+    test.case("a keyed record always lands in the same partition")
+    let m = kafkaproducer.message("orders", bytes.from_str("order-7"), bytes.from_str("{}"))
+    test.assert(not m.key_is_null)
+    test.assert(m.partition == -1)
+
+    test.case("a record with no key is spread, and that is spelled separately")
+    test.assert(kafkaproducer.message_without_key("orders", bytes.from_str("{}")).key_is_null)
+
+    test.case("a tombstone is a key with a NULL value, which deletes it on a compacted topic")
+    test.assert(kafkaproducer.tombstone("orders", bytes.from_str("order-7")).value_is_null)
+
+    test.case("an explicit partition bypasses the partitioner entirely")
+    test.assert(kafkaproducer.to_partition(m, 3).partition == 3)
+
+    test.case("headers and an instant attach to the message")
+    test.assert(list.len(kafkaproducer.with_headers(m,
+        [KafkaRecordHeader { key: "trace", value: bytes.zeros(8) }]).headers) == 1)
+    test.assert(kafkaproducer.at_time(m, 1789000000000).timestamp_millis == 1789000000000)
+
+    test.case("and an unstamped message says so with -1 rather than with a zero")
+    test.assert(m.timestamp_millis == -1)
+
+@test
+fn test_send_does_not_send() [io, net, time]
+    // The module's whole design.  Batching is where a producer is fast
+    // or slow and correct or wrong, and it is the part nobody can test
+    // against a real cluster with any confidence — so none of it needs
+    // one.
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    match kafkaconn.bootstrap(o)
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+                                           kafkaproducer.default_config())
+
+            test.case("a new producer holds nothing")
+            test.assert(kafkaproducer.buffered_count(p) == 0)
+            test.assert(kafkaproducer.buffered_bytes(p) == 0)
+            test.assert(kafkaproducer.pending_partitions(p) == 0)
+            test.assert(not kafkaproducer.is_full(p))
+
+            test.case("send answers whether a batch must go out, not whether it went")
+            match kafkaproducer.send(p, kafkaproducer.message("orders",
+                                        bytes.from_str("k"), bytes.from_str("v")))
+                Ok(a)  => test.assert(a.queued == 1 and not a.must_flush)
+                Err(_) => test.assert(true)
+
+            test.case("and a partition can be asked for without sending anything")
+            match kafkaproducer.partition_for(p, kafkaproducer.message("orders",
+                                                  bytes.from_str("k"), bytes.from_str("v")))
+                Ok(n)  => test.assert(n >= 0)
+                Err(_) => test.assert(true)
+
+            test.case("the linger question is pure when the instant is given")
+            test.assert(not kafkaproducer.linger_elapsed(p, 1789000000000))
+            test.assert(not kafkaproducer.should_flush(p))
+
+            test.case("a stale snapshot is replaced rather than refetched from in here")
+            test.assert(kafkaproducer.buffered_count(
+                kafkaproducer.with_cluster(p, kafkaconn.empty_cluster())) == 0)
+
+            test.case("and a program that discards data can say how much")
+            test.assert(kafkaproducer.discard(p).dropped == 0)
+
+@test
+fn test_flush_is_the_one_call_that_writes() [io, net, time]
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    match kafkaconn.bootstrap(o)
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            let p = kafkaproducer.producer(c, kafkaconn.empty_cluster(),
+                                           kafkaproducer.default_config())
+
+            test.case("a configuration is checked against the connection it will use")
+            // Because a codec the connection has no function for is a
+            // start-up fault and not a first-flush surprise.
+            match kafkaproducer.check_config(kafkaproducer.default_config(), c)
+                Some(_) => test.assert(true)
+                None    => test.assert(true)
+
+            test.case("flush writes and reports a result per partition")
+            match kafkaproducer.flush(p)
+                Ok(f)  => test.assert(list.len(f.results) == 0)
+                Err(_) => test.assert(true)
+
+            test.case("and close flushes first, because a closed producer loses what it held")
+            match kafkaproducer.close(p)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)

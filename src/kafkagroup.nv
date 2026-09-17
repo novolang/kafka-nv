@@ -1,0 +1,492 @@
+// kafkagroup.nv — consumer group membership as a state machine, and
+// the two encodings the members agree on between themselves.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ALMOST ALL OF THIS IS `[]`, AND THAT IS THE POINT.  Group membership
+// is where a Kafka client is hardest to get right and hardest to test:
+// generations, member ids, a leader elected by the coordinator, a
+// rebalance that can start between any two calls.  None of it is I/O.
+// The member id, the generation, whether this member is the leader,
+// which state the membership is in, how an error code moves it, how
+// the leader computes an assignment, and how a subscription and an
+// assignment are encoded — all of it is a pure function of values, so
+// all of it is testable without a cluster.  Four functions here
+// declare `[net, time]`, and they are the four that hand the state to
+// a coordinator and take its answer back.
+//
+// THE COORDINATOR ELECTS A LEADER AND THE LEADER DOES THE WORK.  A
+// `JoinGroup` reply tells every member the group's generation and who
+// the leader is; it gives the LEADER, and nobody else, the list of
+// every member and its subscription.  The leader computes who reads
+// what and sends the whole table back in its `SyncGroup`; the
+// followers send an empty `SyncGroup` and are told their share.  So
+// the assignment algorithm runs in one client, not in the broker, and
+// `assign` is a pure function of a member list and a partition list.
+// A follower that sent assignments would be telling the coordinator
+// what everybody else gets, which is why `kafkareq` spells the two
+// `SyncGroup` calls separately.
+//
+// AN EMPTY MEMBER ID AND A REFUSAL ARE THE FIRST HANDSHAKE, NOT A
+// FAILURE.  A member joins with an empty id; the coordinator answers
+// `MEMBER_ID_REQUIRED` carrying the id it has assigned; the member
+// rejoins with it.  Two round trips, every time, by design — it is how
+// the coordinator stops an endless stream of one-request members from
+// each triggering a rebalance.  `on_error` treats it as a transition
+// and not as an error, and so do `KafkaErrRebalanceInProgress` and
+// `KafkaErrIllegalGeneration`.
+//
+// THE SUBSCRIPTION AND ASSIGNMENT BYTES ARE THE MEMBERS' OWN.  The
+// broker never looks inside them: it carries them from a member to the
+// leader and back.  Their format belongs to the assignment protocol
+// the group named, and `ConsumerProtocolSubscription` and
+// `ConsumerProtocolAssignment` are the ones the Java client uses and
+// therefore the ones a mixed-language group must use.  kafka-codec-nv
+// carries those bytes without interpreting them, because a codec has
+// no business knowing about an assignor; this module encodes and
+// decodes them, because a client does.
+//
+// TWO ASSIGNORS, AND THE COOPERATIVE ONE IS NOT AMONG THEM.  `range`
+// and `roundrobin` both revoke every partition at every rebalance.
+// `cooperative-sticky` does not, and it is what a large group wants —
+// and it needs a second rebalance round and a revocation callback,
+// which is a shape this release does not have.  It is named in the
+// README's "What is not included" rather than half-built here.
+
+use kafkaclienterror
+use kafkaconn
+use kafkaerror
+
+// Where a member is in the join-sync-heartbeat cycle.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     match kafkagroup.state_of(kafkagroup.membership("indexers"))
+//         KgroupUnjoined => println("it has not joined yet")
+//         _              => println("it has")
+// ```
+pub enum KgroupState
+    // Has not joined, or has left.  The state a new membership starts
+    // in and the state a fencing ends in.
+    KgroupUnjoined
+    // A `JoinGroup` is outstanding, or one has been refused with
+    // `MEMBER_ID_REQUIRED` and must be repeated.
+    KgroupJoining
+    // Joined and waiting for the assignment.  The leader is computing
+    // it; a follower is simply waiting.
+    KgroupSyncing
+    // Has an assignment and may fetch.  The only state in which a
+    // consumer reads records.
+    KgroupStable
+    // The coordinator has said a rebalance is under way.  The member
+    // must rejoin; whatever it was fetching is no longer its business.
+    KgroupRebalancing
+    // Another member is using this member's static instance id.  There
+    // are two of this program, and this one must stop rather than
+    // rejoin.
+    KgroupFenced
+
+// Which algorithm decides who reads what.
+pub enum KgroupAssignor
+    // `"range"`.  Sorts each topic's partitions and hands out
+    // contiguous runs.  A member gets neighbouring partitions of every
+    // topic it subscribes to, which is what a job joining two topics
+    // by key wants.  Kafka's own default.
+    KgroupRange
+    // `"roundrobin"`.  Deals every partition of every topic out in
+    // turn.  Balances better than `range` when the members subscribe
+    // to the same topics and the partition counts are uneven.
+    KgroupRoundRobin
+
+// What a member is in a group right now.
+pub struct KgroupMembership
+    group_id: Str
+    // Empty until the coordinator assigns one — see the module
+    // comment.
+    member_id: Str
+    // The static membership id of KIP-345, or empty.  A member that
+    // has one keeps its partitions across a restart instead of
+    // triggering a rebalance.
+    instance_id: Str
+    // Increases at every rebalance.  A request carrying a stale
+    // generation is `KafkaErrIllegalGeneration`, which is what stops
+    // an evicted member from overwriting the position of whoever took
+    // its partitions.
+    generation_id: Int
+    // The member id the coordinator elected as leader.
+    leader_id: Str
+    // Whether this member is that one.  `leader_id == member_id`, kept
+    // as a field so a caller does not compare strings at every branch.
+    is_leader: Bool
+    // Which assignment protocol the group settled on.
+    protocol_name: Str
+    state: KgroupState
+
+// What one member wants to read.
+//
+// The payload of a `JoinGroup` protocol entry, in the
+// `ConsumerProtocolSubscription` format.
+pub struct KgroupSubscription
+    topics: [Str]
+    // Whatever the assignor wants to carry beside the topics — a rack
+    // id, a weight, a generation for a sticky assignor.  Opaque here.
+    user_data: Bytes
+
+// One member's share of the partitions.
+pub struct KgroupAssignment
+    entries: [KgroupAssigned]
+    user_data: Bytes
+
+// One topic's partitions inside an assignment.
+pub struct KgroupAssigned
+    topic: Str
+    partitions: [Int]
+
+// A member and what it asked for, as the leader sees it.
+pub struct KgroupMember
+    member_id: Str
+    instance_id: Str
+    subscription: KgroupSubscription
+
+// A member and what the leader decided it gets.
+pub struct KgroupMemberAssignment
+    member_id: Str
+    assignment: KgroupAssignment
+
+// One partition of one topic, for the assignment computation.
+pub struct KgroupTopicPartition
+    topic: Str
+    partition: Int
+
+// One partition's committed position, as the coordinator stores it.
+//
+// A group offset and a consumer's position are the same number seen
+// from two sides, and they are separate types so that this module
+// does not depend on the consumer: a tool that reports a group's lag
+// without consuming anything uses this and never constructs a
+// consumer at all.
+pub struct KgroupOffset
+    topic: Str
+    partition: Int
+    // THE NEXT OFFSET TO READ, not the last one read.  A consumer that
+    // commits the last offset it processed reprocesses one record per
+    // partition after every restart.
+    next_offset: Int
+    // The leader epoch the offset was read in, or `-1`.
+    leader_epoch: Int
+    // Whatever the application wants to store beside the offset.
+    metadata: Str
+
+// A membership and the reply that changed it.
+pub struct KgroupJoined
+    conn: kafkaconn.Kconn
+    membership: KgroupMembership
+    // Every member and its subscription — populated ONLY when this
+    // member is the leader, and empty otherwise.  The empty list is
+    // not an error.
+    members: [KgroupMember]
+
+// A membership and the assignment it was given.
+pub struct KgroupSynced
+    conn: kafkaconn.Kconn
+    membership: KgroupMembership
+    assignment: KgroupAssignment
+
+// A membership after a heartbeat.
+pub struct KgroupBeat
+    conn: kafkaconn.Kconn
+    membership: KgroupMembership
+    // True when the coordinator answered `REBALANCE_IN_PROGRESS`,
+    // which is the ordinary way a consumer learns a rebalance started.
+    must_rejoin: Bool
+
+// A connection and some committed offsets.
+pub struct KgroupOffsets
+    conn: kafkaconn.Kconn
+    offsets: [KgroupOffset]
+
+// ── the state machine, all of it pure ────────────────────────────────
+
+// A membership that has not joined anything yet.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     let m = kafkagroup.membership("indexers")
+//     println("${m.generation_id}")                      // -1
+// ```
+pub fn membership(group_id: Str) -> KgroupMembership
+    todo("kafka-nv.kafkagroup.membership")
+
+// The same membership as a static member (KIP-345).
+//
+// A static member that rejoins with the same instance id after a
+// restart keeps its partitions instead of triggering a rebalance,
+// which is the difference between a rolling deploy that pauses a
+// consumer group for seconds and one that pauses it for minutes.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println(kafkagroup.with_instance_id(kafkagroup.membership("indexers"), "pod-3").instance_id)
+// ```
+pub fn with_instance_id(m: KgroupMembership, instance_id: Str) -> KgroupMembership
+    todo("kafka-nv.kafkagroup.with_instance_id")
+
+// Which state a membership is in.
+pub fn state_of(m: KgroupMembership) -> KgroupState
+    todo("kafka-nv.kafkagroup.state_of")
+
+// Whether the member holds an assignment and may fetch.
+//
+// The one question a consumer's poll loop asks before every fetch.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println("${kafkagroup.is_stable(kafkagroup.membership("indexers"))}")   // false
+// ```
+pub fn is_stable(m: KgroupMembership) -> Bool
+    todo("kafka-nv.kafkagroup.is_stable")
+
+// Move the membership on, given an error code from a coordinator.
+//
+// THE STATE MACHINE, AND IT IS PURE.  `MEMBER_ID_REQUIRED` records the
+// assigned id and stays in `KgroupJoining`;
+// `REBALANCE_IN_PROGRESS` and `ILLEGAL_GENERATION` go to
+// `KgroupRebalancing`; `UNKNOWN_MEMBER_ID` clears the id and goes back
+// to `KgroupUnjoined`; `FENCED_INSTANCE_ID` goes to `KgroupFenced` and
+// stays there.  Every one of those is a transition rather than a
+// failure, which is why they are here rather than in
+// `kafkaclienterror`.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     let m = kafkagroup.on_error(kafkagroup.membership("indexers"),
+//                                 KafkaErrRebalanceInProgress)
+//     match kafkagroup.state_of(m)
+//         KgroupRebalancing => println("rejoin")
+//         _                 => println("carry on")
+// ```
+pub fn on_error(m: KgroupMembership, code: kafkaerror.KafkaErrorCode) -> KgroupMembership
+    todo("kafka-nv.kafkagroup.on_error")
+
+// Whether an error code from a coordinator is a transition rather than
+// a failure.
+//
+// True for the four `on_error` handles.  A client that surfaced any of
+// them to its caller as "an error from Kafka" has turned the ordinary
+// operation of a consumer group into an application-visible fault.
+pub fn is_membership_event(code: kafkaerror.KafkaErrorCode) -> Bool
+    todo("kafka-nv.kafkagroup.is_membership_event")
+
+// Forget the assignment and go back to `KgroupUnjoined`.
+//
+// What a client does when a connection to the coordinator is lost: the
+// generation is still valid, but nothing about it can be confirmed
+// until a rejoin.
+pub fn reset_membership(m: KgroupMembership) -> KgroupMembership
+    todo("kafka-nv.kafkagroup.reset_membership")
+
+// ── the assignor, also pure ──────────────────────────────────────────
+
+// The protocol name an assignor sends in its `JoinGroup`: `"range"`,
+// `"roundrobin"`.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println(kafkagroup.assignor_name(KgroupRange))     // range
+// ```
+pub fn assignor_name(a: KgroupAssignor) -> Str
+    todo("kafka-nv.kafkagroup.assignor_name")
+
+// The assignor a protocol name denotes, or `None`.
+//
+// `None` for `"sticky"` and `"cooperative-sticky"`, which this release
+// does not implement — see the module comment.  A group whose other
+// members named only those has no protocol in common with this one,
+// and the coordinator says so with
+// `KafkaErrInconsistentGroupProtocol`.
+pub fn assignor_named(name: Str) -> ?KgroupAssignor
+    todo("kafka-nv.kafkagroup.assignor_named")
+
+// Compute who reads what.
+//
+// THE LEADER'S JOB, AND IT RUNS IN A CLIENT RATHER THAN IN THE BROKER
+// — see the module comment.  Pure, so a group's balance can be tested
+// over a hundred shapes in a loop with no cluster, which is the one
+// part of a consumer nobody can otherwise exercise.
+//
+// Every member gets an entry, including one whose share is empty:
+// a member with no partitions must still be told so, or it waits for
+// an assignment that never arrives.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println("${list.len(kafkagroup.assign(KgroupRange, [], []))}")   // 0
+// ```
+pub fn assign(a: KgroupAssignor, members: [KgroupMember],
+              partitions: [KgroupTopicPartition]) -> [KgroupMemberAssignment]
+    todo("kafka-nv.kafkagroup.assign")
+
+// A subscription to some topics.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println("${list.len(kafkagroup.subscription(["orders"]).topics)}")
+// ```
+pub fn subscription(topics: [Str]) -> KgroupSubscription
+    todo("kafka-nv.kafkagroup.subscription")
+
+// An empty assignment.
+pub fn empty_assignment() -> KgroupAssignment
+    todo("kafka-nv.kafkagroup.empty_assignment")
+
+// Every topic and partition an assignment covers, flattened.
+//
+// What a consumer turns into its fetch list.
+pub fn assigned_partitions(a: KgroupAssignment) -> [KgroupTopicPartition]
+    todo("kafka-nv.kafkagroup.assigned_partitions")
+
+// ── the members' own encodings ───────────────────────────────────────
+
+// Encode a subscription in the `ConsumerProtocolSubscription` format.
+//
+// The format the Java client uses, and therefore the one a group with
+// any Java member must use.  The broker never looks inside these bytes
+// — see the module comment.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println("${bytes.len(kafkagroup.encode_subscription(kafkagroup.subscription(["orders"])))}")
+// ```
+pub fn encode_subscription(s: KgroupSubscription) -> Bytes
+    todo("kafka-nv.kafkagroup.encode_subscription")
+
+// Decode a `ConsumerProtocolSubscription`.
+//
+// What the group LEADER calls on every member's metadata before it can
+// assign anything.
+pub fn decode_subscription(b: Bytes) -> Result<KgroupSubscription, kafkaclienterror.KclientFault>
+    todo("kafka-nv.kafkagroup.decode_subscription")
+
+// Encode an assignment in the `ConsumerProtocolAssignment` format.
+pub fn encode_assignment(a: KgroupAssignment) -> Bytes
+    todo("kafka-nv.kafkagroup.encode_assignment")
+
+// Decode a `ConsumerProtocolAssignment`.
+//
+// What every member calls on what its `SyncGroup` answered.
+pub fn decode_assignment(b: Bytes) -> Result<KgroupAssignment, kafkaclienterror.KclientFault>
+    todo("kafka-nv.kafkagroup.decode_assignment")
+
+// ── the four calls that talk to a coordinator ────────────────────────
+
+// Send `JoinGroup`.
+//
+// Handles the `MEMBER_ID_REQUIRED` handshake itself, because it is two
+// round trips by design and a caller that had to write the retry would
+// write it once per program — see the module comment.  Answers a
+// membership carrying the generation, the leader's id and, when this
+// member is the leader, every member's subscription.
+//
+// ```novo
+// use kafkagroup
+// use kafkaconn
+//
+// fn main() [io, net, time]
+//     match kafkaconn.bootstrap(kafkaconn.default_options("novo"))
+//         Err(_) => println("no broker")
+//         Ok(c)  =>
+//             match kafkagroup.join(c, kafkagroup.membership("indexers"),
+//                                   kafkagroup.subscription(["orders"]),
+//                                   KgroupRange, 45000, 300000)
+//                 Ok(j)  => println("generation ${j.membership.generation_id}")
+//                 Err(_) => println("could not join")
+// ```
+pub fn join(c: kafkaconn.Kconn, m: KgroupMembership, s: KgroupSubscription, a: KgroupAssignor,
+            session_timeout_ms: Int,
+            rebalance_timeout_ms: Int) -> Result<KgroupJoined, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkagroup.join")
+
+// Send `SyncGroup` and collect this member's assignment.
+//
+// The leader passes what `assign` computed; a follower passes an empty
+// list.  Passing assignments as a follower is refused, because it
+// would be this member telling the coordinator what every other member
+// gets.
+pub fn sync(c: kafkaconn.Kconn, m: KgroupMembership,
+            assignments: [KgroupMemberAssignment]) -> Result<KgroupSynced, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkagroup.sync")
+
+// Send `Heartbeat`.
+//
+// Tells the coordinator the member is alive, and is the ordinary way
+// the member learns a rebalance started — `must_rejoin` on the answer.
+// A member that stops heartbeating for longer than the session timeout
+// is evicted and its partitions are given away.
+pub fn heartbeat(c: kafkaconn.Kconn,
+                 m: KgroupMembership) -> Result<KgroupBeat, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkagroup.heartbeat")
+
+// Commit offsets for the group.
+//
+// Carries the generation, so a commit from a member the group has
+// moved past is `KafkaErrIllegalGeneration` rather than an overwrite
+// of whoever took its partitions.
+pub fn commit_offsets(c: kafkaconn.Kconn, m: KgroupMembership,
+                      offsets: [KgroupOffset]) -> Result<KgroupOffsets, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkagroup.commit_offsets")
+
+// Read the group's stored offsets.
+//
+// An empty topic list asks for every partition the group has
+// committed.  A partition the group has never committed answers a
+// `next_offset` of `-1`, which is NOT offset zero: it is what sends a
+// new consumer to its reset policy.
+pub fn fetch_offsets(c: kafkaconn.Kconn, group_id: Str,
+                     topics: [Str]) -> Result<KgroupOffsets, kafkaclienterror.KclientFault> [net, time]
+    todo("kafka-nv.kafkagroup.fetch_offsets")
+
+// An offset for a partition.
+//
+// The number is the NEXT offset to read — see `KgroupOffset`.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println("${kafkagroup.offset("orders", 0, 41001).next_offset}")
+// ```
+pub fn offset(topic: Str, partition: Int, next_offset: Int) -> KgroupOffset
+    todo("kafka-nv.kafkagroup.offset")
+
+// Whether a stored offset means "this group has never committed here".
+//
+// `next_offset` of `-1`.  A client that read it as an offset would
+// start every new group at the beginning of the log regardless of its
+// reset policy.
+//
+// ```novo
+// use kafkagroup
+//
+// fn main() [io]
+//     println("${kafkagroup.is_uncommitted(kafkagroup.offset("orders", 0, -1))}")   // true
+// ```
+pub fn is_uncommitted(o: KgroupOffset) -> Bool
+    todo("kafka-nv.kafkagroup.is_uncommitted")

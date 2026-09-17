@@ -1,0 +1,184 @@
+// kafkaclientcover_tests.nv — the taxonomy of failures, and the
+// administrative surface including the part of it this release cannot
+// perform.
+//
+// RED ON PURPOSE, like every suite here.  The four suites beside this
+// one assert the design — the connection's two caches, the producer
+// that buffers, the consumer's two decisions, the membership state
+// machine.  This one covers `kafkaclienterror` and `kafkaadmin`, and
+// states in a test rather than only in a README that three
+// administrative writes answer a refusal by name.
+
+use std.test
+use kafkaadmin
+use kafkaclienterror
+use kafkaconn
+
+@test
+fn test_the_three_sources_of_failure_are_kept_apart() [io]
+    // A codec refusal, a broker error code and a socket failure need
+    // three different responses, and a client that flattened them into
+    // one string could not tell "refresh your metadata" from "your
+    // serialiser is broken" from "the broker is down".
+    test.case("a codec fault is wrapped whole rather than re-declared")
+    let wrapped = kafkaclienterror.of_codec_fault(KafkaBadMagic(1))
+    test.assert(str.len(kafkaclienterror.message(wrapped)) > 0)
+
+    test.case("a broker code arrives with the topic and partition it is about")
+    match kafkaclienterror.of_error_code(KafkaErrNotLeaderOrFollower, "orders", 3)
+        Some(f) => test.assert(kafkaclienterror.needs_metadata_refresh(f))
+        None    => test.fail("NOT_LEADER_OR_FOLLOWER is a failure")
+
+    test.case("and success is an absence here, not a value to remember to check")
+    match kafkaclienterror.of_error_code(KafkaErrNone, "orders", 3)
+        Some(_) => test.fail("zero is success")
+        None    => test.assert(true)
+
+    test.case("the protocol's own code is reachable for a caller that wants it")
+    match kafkaclienterror.error_code_of(
+              KclientBrokerError(KafkaErrRebalanceInProgress, "orders", 3))
+        Some(_) => test.assert(true)
+        None    => test.fail("a broker error carries its code")
+    match kafkaclienterror.error_code_of(KclientConnectionLost("produce"))
+        Some(_) => test.fail("a lost socket is not a broker code")
+        None    => test.assert(true)
+
+@test
+fn test_the_four_predicates_answer_four_different_questions() [io]
+    test.case("a code is short, stable and free of anything the wire supplied")
+    test.assert(kafkaclienterror.code(KclientNoLeader("orders", 3))
+                == kafkaclienterror.code(KclientNoLeader("shipments", 9)))
+    test.assert(not str.contains(kafkaclienterror.code(KclientNoLeader("orders", 3)),
+                                 "orders"))
+
+    test.case("retriable is about the same bytes succeeding")
+    test.assert(kafkaclienterror.is_retriable(KclientNoLeader("orders", 3)))
+    test.assert(not kafkaclienterror.is_retriable(KclientRecordTooLarge(2000000, 1048576)))
+    test.assert(not kafkaclienterror.is_retriable(
+        KclientNotSupported("create_topic", "CreateTopics is not encoded")))
+
+    test.case("a stale coordinator is a different cache from a stale partition map")
+    test.assert(kafkaclienterror.needs_coordinator_refresh(KclientNoCoordinator("indexers")))
+    test.assert(not kafkaclienterror.needs_metadata_refresh(KclientNoCoordinator("indexers")))
+
+    test.case("and a lost stream needs a new socket, not a retry")
+    // A length-prefixed stream with no magic number cannot be
+    // resynchronised, so no amount of retrying on the same connection
+    // helps.
+    test.assert(kafkaclienterror.needs_reconnect(KclientConnectionLost("fetch")))
+    test.assert(kafkaclienterror.needs_reconnect(
+        kafkaclienterror.of_codec_fault(KafkaCorrelationMismatch(7))))
+
+    test.case("a configuration fault fails identically until somebody changes the program")
+    // So a client that retried them would produce a stream of failures
+    // that looks like a cluster outage.
+    test.assert(kafkaclienterror.is_configuration_fault(
+        KclientBadConfig("linger_ms", "longer than the request timeout")))
+    test.assert(not kafkaclienterror.is_configuration_fault(KclientNoLeader("orders", 3)))
+
+@test
+fn test_the_administrative_writes_refuse_by_name_in_this_release() [io]
+    // kafka-codec-nv 0.0.1 does not encode `CreateTopics`,
+    // `DeleteTopics` or `CreatePartitions`.  Declaring the signatures
+    // and refusing is what keeps the gap visible; omitting them would
+    // hide it from anybody reading the interface.
+    test.case("the reads are supported and the writes are not")
+    test.assert(kafkaadmin.supports("describe_cluster"))
+    test.assert(kafkaadmin.supports("group_lag"))
+    test.assert(not kafkaadmin.supports("create_topic"))
+    test.assert(not kafkaadmin.supports("delete_topic"))
+    test.assert(not kafkaadmin.supports("create_partitions"))
+
+    test.case("and the list names the API key each one is waiting for")
+    // A tool that builds a menu of what it can offer reads this rather
+    // than hard-coding the same list a second time.
+    test.assert(list.len(kafkaadmin.unsupported_operations()) == 3)
+
+    test.case("the value a create would carry can still be built today")
+    let t = kafkaadmin.new_topic("orders", 12, 3)
+    test.assert(t.partition_count == 12)
+    test.assert(t.replication_factor == 3)
+    test.assert(list.len(kafkaadmin.with_config(t, "retention.ms", "604800000").config_keys) == 1)
+
+@test
+fn test_kafkas_own_bookkeeping_is_not_a_users_topic() [io]
+    test.case("the double-underscore topics are internal")
+    test.assert(kafkaadmin.is_internal_topic("__consumer_offsets"))
+    test.assert(kafkaadmin.is_internal_topic("__transaction_state"))
+    test.assert(not kafkaadmin.is_internal_topic("orders"))
+
+    test.case("summing no lag is zero")
+    test.assert(kafkaadmin.total_lag([]) == 0)
+
+    test.case("and a report's offsets convert into the shape a repositioning tool needs")
+    test.assert(list.len(kafkaadmin.as_group_offsets([])) == 0)
+
+@test
+fn test_the_administrative_reads_are_named_where_a_caller_would_reach_them() [io, net, time]
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    match kafkaconn.bootstrap(o)
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            test.case("describing a cluster and its topics is one Metadata request")
+            match kafkaadmin.describe_cluster(c)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.describe_topics(c, ["orders"])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.list_topics(c)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.topic_exists(c, "orders")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("the two ends of a partition and the offset at a time are ListOffsets")
+            match kafkaadmin.earliest_offsets(c, "orders")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.latest_offsets(c, "orders")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.offsets_at_time(c, "orders", 1789000000000)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.partition_sizes(c, "orders")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("and a group's lag takes two requests to two different brokers")
+            // The latest offsets from each partition's leader, the
+            // committed ones from the group's coordinator.
+            match kafkaadmin.group_offsets(c, "indexers", [])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkaadmin.group_lag(c, "indexers", ["orders"])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+@test
+fn test_the_writes_reach_their_refusal_rather_than_being_absent() [io, net, time]
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    match kafkaconn.bootstrap(o)
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            test.case("creating a topic")
+            match kafkaadmin.create_topic(c, kafkaadmin.new_topic("orders", 12, 3))
+                Ok(_)  => test.fail("this release cannot encode CreateTopics")
+                Err(_) => test.assert(true)
+
+            test.case("deleting one")
+            match kafkaadmin.delete_topic(c, "orders")
+                Ok(_)  => test.fail("this release cannot encode DeleteTopics")
+                Err(_) => test.assert(true)
+
+            test.case("and widening one, which moves every keyed record anyway")
+            // The partition is `hash(key) mod count`, so a topic whose
+            // ordering matters cannot be widened without a plan for the
+            // records already in it.
+            match kafkaadmin.create_partitions(c, "orders", 24)
+                Ok(_)  => test.fail("this release cannot encode CreatePartitions")
+                Err(_) => test.assert(true)

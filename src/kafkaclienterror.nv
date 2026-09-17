@@ -1,0 +1,218 @@
+// kafkaclienterror.nv — everything that can go wrong between a program
+// and a Kafka cluster, and what each one means the program should do
+// next.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THREE SOURCES OF FAILURE, KEPT APART BECAUSE THE FIXES ARE
+// DIFFERENT.  A codec refusal means the bytes did not decode — the
+// connection is suspect and nothing can be said about the topic.  A
+// broker error code means the bytes decoded perfectly and the cluster
+// is telling the client something about a topic, a partition or a
+// group.  A socket failure means neither happened.  A client that
+// flattened the three into one string could not tell "refresh your
+// metadata and retry" from "your serialiser is broken" from "the
+// broker is down".
+//
+// THE CODEC'S FAULTS ARE WRAPPED, NOT RE-DECLARED.  `KclientCodecFault`
+// carries `kafkaerror.KafkaFault` whole.  Re-declaring its sixteen arms
+// here would be a second copy to keep in step, and the registry's rule
+// that public type names are unique means the copy would need
+// different names for the same things — which is exactly how two
+// vocabularies for one fact get into a code base.
+//
+// A BROKER ERROR CODE ARRIVES WITH ITS TOPIC AND PARTITION, and that
+// is why it is a variant here rather than a bare re-export.  The code
+// alone is not actionable: a `NOT_LEADER_OR_FOLLOWER` names which
+// partition moved, and a client that lost that has to refresh
+// everything rather than one entry.
+//
+// `is_retriable` IS NOT `needs_metadata_refresh` IS NOT
+// `needs_reconnect`, and the three are separate for the same reason
+// kafka-codec-nv's are: a client with one of them retries a request
+// against the broker that just refused it, forever.  This module adds
+// the third — whether the SOCKET must be replaced — because a codec
+// fault that lost the stream's framing is not fixed by any amount of
+// retrying on the same connection.
+
+use kafkaerror
+
+// A failure talking to a Kafka cluster.
+pub enum KclientFault
+    // The bytes did not decode, or a value could not be encoded.
+    // Carries the codec's own fault whole.
+    KclientCodecFault(inner: kafkaerror.KafkaFault)
+    // A broker answered a request with an error code, for a named
+    // topic and partition.  `partition` is `-1` when the code was not
+    // about one.
+    KclientBrokerError(code: kafkaerror.KafkaErrorCode, topic: Str, partition: Int)
+    // The socket could not be opened.
+    KclientConnectFailed(host: Str, port: Int, detail: Str)
+    // The connection went away mid-exchange.  `during` names what was
+    // in flight, because for a produce that is the difference between
+    // "not written" and "possibly written twice".
+    KclientConnectionLost(during: Str)
+    // A deadline passed.
+    KclientTimedOut(operation: Str, ms: Int)
+    // Every address in the bootstrap list was tried and none answered.
+    // A separate variant from `KclientConnectFailed` because the
+    // useful message names how many were tried rather than the last
+    // one's host.
+    KclientNoBroker(tried: Int, detail: Str)
+    // The metadata names no leader for a partition.  Usually an
+    // election in progress, and usually fixed by refreshing and
+    // retrying.
+    KclientNoLeader(topic: Str, partition: Int)
+    // No broker coordinates the group yet.
+    KclientNoCoordinator(group_id: Str)
+    // A configuration value is impossible: a linger longer than the
+    // request timeout, an idempotent producer with `acks` that is not
+    // `all`, a consumer with no topics.  Found by `check_config`,
+    // ideally at start-up, where the message can name the field.
+    KclientBadConfig(field: Str, detail: Str)
+    // Something this release cannot do, with the reason.  The
+    // administrative writes are the whole of this variant's use
+    // today: kafka-codec-nv 0.0.1 does not encode `CreateTopics`,
+    // `DeleteTopics` or `CreatePartitions`, so `kafkaadmin` refuses
+    // them by name rather than pretending.  See the README's Status.
+    KclientNotSupported(what: Str, why: Str)
+    // A record is larger than the producer's `max_request_bytes`, so
+    // no batch could ever carry it.  Refused at `send` rather than at
+    // `flush`, because a caller that learns this after buffering a
+    // thousand messages has to decide what to do with the other nine
+    // hundred and ninety-nine.
+    KclientRecordTooLarge(bytes_given: Int, limit: Int)
+    // The consumer has no position for a partition and the reset
+    // policy is `KconsumerRefuse`.
+    KclientOffsetUnknown(topic: Str, partition: Int)
+    // The group is rebalancing and this member must rejoin before it
+    // does anything else.  ROUTINE, not a failure: it is how a
+    // consumer learns a rebalance started.
+    KclientRebalanceRequired(group_id: Str)
+    // Another member is using this member's static instance id, or the
+    // producer's epoch was taken over.  The program must stop: there
+    // are two of it.
+    KclientFenced(detail: Str)
+    // The producer or consumer has been closed and cannot be used.
+    KclientClosed(what: Str)
+
+// One line naming what went wrong, for a report a person reads.
+//
+// ```novo
+// use kafkaclienterror
+//
+// fn main() [io]
+//     println(kafkaclienterror.message(KclientNoLeader("orders", 3)))
+// ```
+pub fn message(f: KclientFault) -> Str
+    todo("kafka-nv.kafkaclienterror.message")
+
+// A short stable word for a metric label: `"no_leader"`,
+// `"rebalance_required"`, `"record_too_large"`.
+//
+// Free of anything the wire or the caller supplied, so a topic name
+// an attacker chose cannot become a time-series dimension.
+//
+// ```novo
+// use kafkaclienterror
+//
+// fn main() [io]
+//     println(kafkaclienterror.code(KclientNoLeader("orders", 3)))   // no_leader
+// ```
+pub fn code(f: KclientFault) -> Str
+    todo("kafka-nv.kafkaclienterror.code")
+
+// Whether sending the same request again could succeed.
+//
+// True for the transient cluster states and for a timeout; false for a
+// configuration fault, a record that is too large, a fencing and
+// anything `KclientNotSupported`.
+//
+// ```novo
+// use kafkaclienterror
+//
+// fn main() [io]
+//     println("${kafkaclienterror.is_retriable(KclientNoLeader("orders", 3))}")
+// ```
+pub fn is_retriable(f: KclientFault) -> Bool
+    todo("kafka-nv.kafkaclienterror.is_retriable")
+
+// Whether the client's map of which broker leads which partition is
+// stale.
+//
+// A retry without a `Metadata` request first gets the same answer for
+// as long as it keeps trying — see the module comment.
+pub fn needs_metadata_refresh(f: KclientFault) -> Bool
+    todo("kafka-nv.kafkaclienterror.needs_metadata_refresh")
+
+// Whether the client's group-coordinator cache is stale.
+//
+// A separate lookup from the metadata one, with its own cache and its
+// own staleness.
+pub fn needs_coordinator_refresh(f: KclientFault) -> Bool
+    todo("kafka-nv.kafkaclienterror.needs_coordinator_refresh")
+
+// Whether the SOCKET must be replaced before anything else is tried.
+//
+// True for a lost connection and for any codec fault that
+// `kafkaerror.is_fatal_to_connection` calls fatal — a correlation
+// mismatch, trailing bytes, a malformed varint.  Each means the
+// decoder no longer knows where the next frame begins, and a
+// length-prefixed stream with no magic number cannot be
+// resynchronised.  No amount of retrying on the same connection helps.
+//
+// ```novo
+// use kafkaclienterror
+//
+// fn main() [io]
+//     println("${kafkaclienterror.needs_reconnect(KclientConnectionLost("produce"))}")
+// ```
+pub fn needs_reconnect(f: KclientFault) -> Bool
+    todo("kafka-nv.kafkaclienterror.needs_reconnect")
+
+// Whether the failure is a fault in the PROGRAM's own configuration
+// rather than in the cluster.
+//
+// `KclientBadConfig` and `KclientRecordTooLarge`.  Those two fail
+// identically for every request until somebody changes the program, so
+// a client that retried them would produce a stream of failures that
+// looks like a cluster outage.
+pub fn is_configuration_fault(f: KclientFault) -> Bool
+    todo("kafka-nv.kafkaclienterror.is_configuration_fault")
+
+// Wrap a codec fault.
+//
+// ```novo
+// use kafkaclienterror
+//
+// fn main() [io]
+//     println(kafkaclienterror.code(kafkaclienterror.of_codec_fault(KafkaBadMagic(1))))
+// ```
+pub fn of_codec_fault(f: kafkaerror.KafkaFault) -> KclientFault
+    todo("kafka-nv.kafkaclienterror.of_codec_fault")
+
+// Turn a broker's error code for a topic and partition into a fault,
+// or `None` when the code is `KafkaErrNone`.
+//
+// The function every response handler in this package runs its result
+// codes through, so that "success" is an absence here rather than a
+// value everybody has to remember to check.
+//
+// ```novo
+// use kafkaclienterror
+//
+// fn main() [io]
+//     match kafkaclienterror.of_error_code(KafkaErrNone, "orders", 3)
+//         Some(_) => println("something failed")
+//         None    => println("that partition succeeded")
+// ```
+pub fn of_error_code(c: kafkaerror.KafkaErrorCode, topic: Str, partition: Int) -> ?KclientFault
+    todo("kafka-nv.kafkaclienterror.of_error_code")
+
+// The broker error code a fault carries, or `None`.
+//
+// For a caller that wants to branch on the protocol's own code rather
+// than on this package's taxonomy — a consumer treating
+// `KafkaErrMemberIdRequired` as routine, for instance.
+pub fn error_code_of(f: KclientFault) -> ?kafkaerror.KafkaErrorCode
+    todo("kafka-nv.kafkaclienterror.error_code_of")

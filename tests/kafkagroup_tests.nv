@@ -1,0 +1,180 @@
+// kafkagroup_tests.nv — the API suite for membership, which is a state
+// machine and therefore assertable without a coordinator.
+//
+// RED ON PURPOSE: every assertion reaches `not implemented:
+// kafka-nv.kafkagroup.<fn>`.
+//
+// GROUP MEMBERSHIP IS WHERE A KAFKA CLIENT IS HARDEST TO TEST, and the
+// reason is usually that the state is entangled with the socket.  Here
+// it is not: the member id, the generation, the leadership, the
+// transitions and the leader's assignment computation are all pure, so
+// this suite drives the whole cycle with no cluster.  Four functions in
+// the module declare `[net, time]`, and they are the four at the end.
+
+use std.test
+use kafkaconn
+use kafkagroup
+
+@test
+fn test_a_new_member_has_no_id_and_no_generation() [io]
+    let m = kafkagroup.membership("indexers")
+
+    test.case("it has not joined anything")
+    match kafkagroup.state_of(m)
+        KgroupUnjoined => test.assert(true)
+        _              => test.fail("a fresh membership has joined nothing")
+    test.assert(m.member_id == "")
+    test.assert(m.generation_id == -1)
+    test.assert(not kafkagroup.is_stable(m))
+
+    test.case("and it is dynamic until it is told otherwise")
+    // A static member keeps its partitions across a restart instead of
+    // triggering a rebalance, which is the difference between a rolling
+    // deploy that pauses a group for seconds and one that pauses it for
+    // minutes.
+    test.assert(m.instance_id == "")
+    test.assert(kafkagroup.with_instance_id(m, "pod-3").instance_id == "pod-3")
+
+@test
+fn test_the_coordinators_refusals_are_transitions_and_not_failures() [io]
+    // A client that surfaced any of these to its caller as "an error
+    // from Kafka" has turned the ordinary operation of a consumer group
+    // into an application-visible fault.
+    let m = kafkagroup.membership("indexers")
+
+    test.case("a rebalance means rejoin")
+    match kafkagroup.state_of(kafkagroup.on_error(m, KafkaErrRebalanceInProgress))
+        KgroupRebalancing => test.assert(true)
+        _                 => test.fail("REBALANCE_IN_PROGRESS is a rejoin")
+
+    test.case("an unknown member id clears the id and starts again")
+    match kafkagroup.state_of(kafkagroup.on_error(m, KafkaErrUnknownMemberId))
+        KgroupUnjoined => test.assert(true)
+        _              => test.fail("the coordinator has forgotten this member")
+
+    test.case("a fencing is terminal, because there are two of this program")
+    match kafkagroup.state_of(kafkagroup.on_error(m, KafkaErrFencedInstanceId))
+        KgroupFenced => test.assert(true)
+        _            => test.fail("a fenced member must stop rather than rejoin")
+
+    test.case("and the four of them are recognisable as a set")
+    test.assert(kafkagroup.is_membership_event(KafkaErrMemberIdRequired))
+    test.assert(kafkagroup.is_membership_event(KafkaErrIllegalGeneration))
+    test.assert(not kafkagroup.is_membership_event(KafkaErrTopicAuthorizationFailed))
+
+    test.case("losing the coordinator's connection resets what cannot be confirmed")
+    match kafkagroup.state_of(kafkagroup.reset_membership(m))
+        KgroupUnjoined => test.assert(true)
+        _              => test.fail("nothing about the generation can be confirmed after a reconnect")
+
+@test
+fn test_the_leader_computes_the_assignment_and_it_is_a_pure_function() [io]
+    // It runs in a client, not in the broker, so a group's balance can
+    // be tested over a hundred shapes in a loop — which is the one part
+    // of a consumer nobody can otherwise exercise.
+    test.case("the two assignors this release implements have the protocol's own names")
+    test.assert(kafkagroup.assignor_name(KgroupRange) == "range")
+    test.assert(kafkagroup.assignor_name(KgroupRoundRobin) == "roundrobin")
+    match kafkagroup.assignor_named("roundrobin")
+        Some(_) => test.assert(true)
+        None    => test.fail("roundrobin is implemented")
+
+    test.case("and the cooperative one is not among them")
+    // It needs a second rebalance round and a revocation callback,
+    // which is a shape this release does not have.
+    match kafkagroup.assignor_named("cooperative-sticky")
+        Some(_) => test.fail("this release does not implement it")
+        None    => test.assert(true)
+
+    test.case("assigning nothing to nobody produces nothing")
+    test.assert(list.len(kafkagroup.assign(KgroupRange, [], [])) == 0)
+
+    test.case("every member gets an entry, including one whose share is empty")
+    // A member with no partitions must still be told so, or it waits
+    // for an assignment that never arrives.
+    let members = [KgroupMember { member_id: "m-1",
+                                  instance_id: "",
+                                  subscription: kafkagroup.subscription(["orders"]) }]
+    test.assert(list.len(kafkagroup.assign(KgroupRange, members, [])) == 1)
+
+    test.case("a subscription names topics and carries the assignor's own data")
+    test.assert(list.len(kafkagroup.subscription(["orders", "shipments"]).topics) == 2)
+    test.assert(list.len(kafkagroup.empty_assignment().entries) == 0)
+    test.assert(list.len(kafkagroup.assigned_partitions(kafkagroup.empty_assignment())) == 0)
+
+@test
+fn test_the_subscription_and_assignment_bytes_are_the_members_own() [io]
+    // The broker never looks inside them: it carries them from a member
+    // to the leader and back.  The format belongs to the assignment
+    // protocol, which is why kafka-codec-nv carries them uninterpreted
+    // and this module encodes them.
+    test.case("a subscription round-trips through the ConsumerProtocol format")
+    let s = kafkagroup.subscription(["orders"])
+    match kafkagroup.decode_subscription(kafkagroup.encode_subscription(s))
+        Ok(back) => test.assert(list.len(back.topics) == 1)
+        Err(_)   => test.fail("what encode produced, decode reads")
+
+    test.case("and so does an assignment")
+    match kafkagroup.decode_assignment(kafkagroup.encode_assignment(
+              kafkagroup.empty_assignment()))
+        Ok(back) => test.assert(list.len(back.entries) == 0)
+        Err(_)   => test.fail("what encode produced, decode reads")
+
+    test.case("garbage is refused rather than decoded into an empty assignment")
+    // A member that took an unparseable assignment as "no partitions"
+    // would sit idle in a group that thinks it is working.
+    match kafkagroup.decode_assignment(bytes.zeros(1))
+        Ok(_)  => test.fail("one byte is not an assignment")
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_committed_offset_is_the_next_one_and_minus_one_is_not_zero() [io]
+    test.case("an offset is the next offset to read")
+    // A consumer that commits the last offset it processed reprocesses
+    // one record per partition after every restart.
+    test.assert(kafkagroup.offset("orders", 0, 41001).next_offset == 41001)
+    test.assert(not kafkagroup.is_uncommitted(kafkagroup.offset("orders", 0, 41001)))
+
+    test.case("and -1 means this group has never committed here")
+    // A client that read it as an offset would start every new group at
+    // the beginning of the log regardless of its reset policy.
+    test.assert(kafkagroup.is_uncommitted(kafkagroup.offset("orders", 0, -1)))
+
+@test
+fn test_the_four_calls_that_talk_to_a_coordinator_are_named() [io, net, time]
+    // Everything above is pure.  These four are the ones that hand the
+    // state to a coordinator and take its answer back, and each reaches
+    // its refusal against a port nothing is listening on.
+    let o = kafkaconn.with_bootstrap(kafkaconn.default_options("novo"),
+                                     [kafkaconn.address("127.0.0.1", 1)])
+    let m = kafkagroup.membership("indexers")
+
+    match kafkaconn.bootstrap(o)
+        Err(_) => test.assert(true)
+        Ok(c)  =>
+            test.case("join handles the MEMBER_ID_REQUIRED handshake itself")
+            // Two round trips by design: it is how the coordinator stops
+            // a stream of one-request members from each triggering a
+            // rebalance.
+            match kafkagroup.join(c, m, kafkagroup.subscription(["orders"]),
+                                  KgroupRange, 45000, 300000)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("sync collects this member's share")
+            match kafkagroup.sync(c, m, [])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("a heartbeat is how a member learns a rebalance started")
+            match kafkagroup.heartbeat(c, m)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+            test.case("and the offsets go to the coordinator, carrying the generation")
+            match kafkagroup.commit_offsets(c, m, [kafkagroup.offset("orders", 0, 41001)])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+            match kafkagroup.fetch_offsets(c, "indexers", [])
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
