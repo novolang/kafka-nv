@@ -96,6 +96,24 @@ pub enum KclientFault
     // The producer or consumer has been closed and cannot be used.
     KclientClosed(what: Str)
 
+// `KclientFault` is an `Error`, which is what lets
+// `Result<T, KclientFault>` exist at all — every call in `kafkaconn`,
+// `kafkaproducer`, `kafkaconsumer`, `kafkagroup` and `kafkaadmin` that
+// touches a broker answers with one.
+//
+// The wrapped `kafkaerror.KafkaFault` carries its own impl, in the
+// module that declares it, and this one is separate for the same
+// reason the types are: the message a person reads about a client is
+// about the cluster, and the codec's message is about bytes.
+impl Error for KclientFault
+    // The one-line message: `kafkaclienterror.message`'s sentence,
+    // naming what failed and the topic, partition or group it was
+    // about.
+    //
+    // Panics with `not implemented` until the bodies land.
+    fn message(self) -> Str
+        todo("kafka-nv.KclientFault.message")
+
 // One line naming what went wrong, for a report a person reads.
 //
 // ```novo
