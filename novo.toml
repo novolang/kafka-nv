@@ -82,4 +82,4 @@ novo        = ">= 0.9.0"
 # for that reason, so the publish dry-run for this package cannot pass
 # until kafka-codec-nv is on the registry and this line is rewritten.
 # The CHANGELOG's Known section says so.
-kafka-codec-nv = { path = "../kafka-codec-nv" }
+kafka-codec-nv = "^0.0.1"

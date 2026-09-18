@@ -8,5 +8,8 @@ version = "0.1.4"
 hash = "6fe2273f15e1fafc45e2156d7a4e23e03e45ba48e6db90bdb0ff79c6296f76eb"
 
 [kafka-codec-nv]
-source = "path"
-path = "../kafka-codec-nv"
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.0.1"
+version = "0.0.1"
+hash = "578d10e72ffc16669fd19c442a8b046229f6e744365421d4fb8a249c4d01ef80"
